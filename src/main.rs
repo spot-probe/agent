@@ -182,8 +182,53 @@ fn remaining(last_frame: Instant) -> Duration {
     HUB_SILENCE.saturating_sub(last_frame.elapsed())
 }
 
+/// `--ping <host>`: one echo, and everything an operator needs to tell a **missing
+/// permission** from a **missing route** -- which look identical from the hub.
+///
+/// Blocking for at most the handshake deadline, in an async fn, on purpose: this is a
+/// command-line self-test that prints and exits, not a loop.
+async fn self_test(target: &str) -> Result<()> {
+    let addr = tokio::net::lookup_host((target, 0))
+        .await
+        .with_context(|| format!("cannot resolve {target}"))?
+        .next()
+        .with_context(|| format!("{target} resolved to no address"))?;
+    eprintln!("{target} resolves to {addr}");
+    eprintln!("sending an ICMP echo (unprivileged datagram socket first, raw as a fallback)");
+    match icmp::ping_once(addr, HANDSHAKE_DEADLINE) {
+        Ok(rtt) => {
+            eprintln!("echo reply in {} ms", rtt.as_millis());
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("no sample: {e}");
+            if e == icmp::IcmpError::Permission {
+                eprintln!(
+                    "  allow unprivileged ICMP (sysctl net.ipv4.ping_group_range) or give the \
+                     service CAP_NET_RAW -- see the docs for the unit file"
+                );
+            }
+            std::process::exit(1)
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Before `parse_args`, deliberately: a self-test needs neither a server nor a token,
+    // and `parse_args` refuses to go on without both. Checked here rather than as a flag
+    // inside it so that `Args` -- and every place that builds one -- stays as it is.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(at) = argv.iter().position(|a| a == "--ping") {
+        let host = match argv.get(at + 1) {
+            Some(host) => host.as_str(),
+            None => {
+                eprintln!("--ping needs a host, for example: monitor-agent --ping 1.1.1.1");
+                std::process::exit(2)
+            }
+        };
+        return self_test(host).await;
+    }
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
     // Reported once at startup. install.sh hardens this unit with
