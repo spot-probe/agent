@@ -141,6 +141,65 @@ mod tests {
     }
 }
 
+/// The v6 half.
+///
+/// **Connected first**, for two reasons: an ICMPv6 datagram socket has to be connected
+/// before it will send, and `local_addr` on that connection is how the source address the
+/// **pseudo-header** needs becomes known. Guessing the source (or using `::`) is the
+/// classic v6 mistake -- the message looks well formed and every reply is dropped.
+///
+/// On the raw fallback the kernel checksums the message for us (`IPPROTO_ICMPV6`), so a
+/// checksum we wrote would be wrong there; the packet is built the same way on both paths
+/// and the kernel overwrites it on that one.
+fn ping_once_v6(addr: std::net::SocketAddrV6, timeout: Duration) -> Result<Duration, IcmpError> {
+    let socket = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::ICMPV6)) {
+        Ok(socket) => socket,
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            match Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::ICMPV6)) {
+                Ok(socket) => socket,
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => return Err(IcmpError::Permission),
+                Err(_) => return Err(IcmpError::Socket),
+            }
+        }
+        Err(_) => return Err(IcmpError::Socket),
+    };
+    let target: socket2::SockAddr = addr.into();
+    socket.connect(&target).map_err(|e| match e.kind() {
+        ErrorKind::PermissionDenied => IcmpError::Permission,
+        _ => IcmpError::Socket,
+    })?;
+    let src = match socket.local_addr().ok().and_then(|a| a.as_socket()) {
+        Some(SocketAddr::V6(local)) => *local.ip(),
+        _ => return Err(IcmpError::Socket),
+    };
+    socket.set_read_timeout(Some(timeout)).map_err(|_| IcmpError::Socket)?;
+
+    let seq = (Instant::now().elapsed().subsec_nanos() % u32::from(u16::MAX)) as u16;
+    let packet = build_echo6(std::process::id() as u16, seq, src, *addr.ip());
+    let started = Instant::now();
+    socket.send(&packet).map_err(|e| match e.kind() {
+        ErrorKind::PermissionDenied => IcmpError::Permission,
+        _ => IcmpError::Socket,
+    })?;
+
+    let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1500];
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                let filled = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
+                if parse_reply_v6(filled).is_some_and(|(_, got)| got == seq) {
+                    return Ok(started.elapsed());
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(IcmpError::Timeout)
+            }
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return Err(IcmpError::Permission),
+            Err(_) => return Err(IcmpError::Socket),
+        }
+    }
+}
+
 /// Why a probe produced no sample.
 ///
 /// Kept apart rather than collapsed into "no answer": **a probe that cannot run must
@@ -187,9 +246,14 @@ impl std::fmt::Display for IcmpError {
 /// id we wrote never comes back on that path. Nothing else is listening on this
 /// socket, so the sequence is what identifies it.
 pub fn ping_once(addr: SocketAddr, timeout: Duration) -> Result<Duration, IcmpError> {
-    if addr.is_ipv6() {
-        return Err(IcmpError::Address);
+    match addr {
+        SocketAddr::V4(v4) => ping_once_v4(v4, timeout),
+        SocketAddr::V6(v6) => ping_once_v6(v6, timeout),
     }
+}
+
+/// The v4 half, unchanged: this is the path the harness measured at ~68 ms.
+fn ping_once_v4(addr: std::net::SocketAddrV4, timeout: Duration) -> Result<Duration, IcmpError> {
     let socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)) {
         Ok(socket) => socket,
         Err(e) if e.kind() == ErrorKind::PermissionDenied => {
@@ -247,15 +311,6 @@ mod error_tests {
         assert!(IcmpError::Permission.to_string().contains("CAP_NET_RAW"));
         assert!(IcmpError::Timeout.to_string().contains("timeout"));
         assert_ne!(IcmpError::Permission, IcmpError::Timeout, "and they are not each other");
-    }
-
-    /// An IPv6 target is refused as an address problem, not reported as a loss: the
-    /// v6 message shape is the next step, and a silent 100% loss would be read as a
-    /// broken link.
-    #[test]
-    fn an_ipv6_target_is_refused_with_a_reason() {
-        let v6: SocketAddr = "[2606:4700:4700::1111]:0".parse().unwrap();
-        assert_eq!(ping_once(v6, Duration::from_millis(1)), Err(IcmpError::Address));
     }
 }
 
