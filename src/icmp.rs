@@ -8,6 +8,12 @@
 //! IPv4 first. ICMPv6 (types 128/129, whose checksum covers a pseudo-header) is the
 //! next step; the shapes here are what it will follow.
 
+use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use socket2::{Domain, Protocol, Socket, Type};
+
 /// ICMPv6 is a later step; the v4 types are what this file speaks today.
 pub const ECHO_REQUEST: u8 = 8;
 pub const ECHO_REPLY: u8 = 0;
@@ -126,5 +132,123 @@ mod tests {
         assert_eq!(parse_reply(&[]), None, "and nothing at all is not a reply");
         // An IPv4 header whose IHL runs past the buffer.
         assert_eq!(parse_reply(&[0x4f, 0, 0, 0, 0, 1, 0, 1]), None, "IHL 15 needs 60 bytes");
+    }
+}
+
+/// Why a probe produced no sample.
+///
+/// Kept apart rather than collapsed into "no answer": **a probe that cannot run must
+/// not look like a probe that timed out**, or the chart shows a probe at 100% loss
+/// and every reader blames the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcmpError {
+    /// Neither socket could be opened: needs `CAP_NET_RAW`, or a
+    /// `net.ipv4.ping_group_range` covering this user's group.
+    Permission,
+    /// Sent, and nothing came back in time.
+    Timeout,
+    /// The socket failed for another reason.
+    Socket,
+    /// Not an address this probe can use -- IPv6 today.
+    Address,
+}
+
+impl std::fmt::Display for IcmpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::Permission => "ICMP needs CAP_NET_RAW or a net.ipv4.ping_group_range                                  covering this agent's user",
+            Self::Timeout => "no echo reply within the timeout",
+            Self::Socket => "the ICMP socket failed",
+            Self::Address => "this probe speaks IPv4 only for now",
+        };
+        f.write_str(text)
+    }
+}
+
+/// One echo, one reply, one round trip.
+///
+/// Blocking on purpose: the agent's runtime is single-threaded and its cadence is
+/// seconds, so the caller wraps this in `spawn_blocking` rather than the probe
+/// growing an async socket layer of its own.
+///
+/// A **datagram** socket first, because the agent runs as the unprivileged
+/// `monitor-agent` user and most hosts allow it; a **raw** socket as the fallback for
+/// the hosts that do not. If both are refused the answer is `Permission`, never a
+/// timeout -- see `IcmpError`.
+///
+/// The reply is matched on its **sequence**, not its identifier: an unprivileged
+/// datagram socket has the kernel rewrite the id (it is the socket's port), so the
+/// id we wrote never comes back on that path. Nothing else is listening on this
+/// socket, so the sequence is what identifies it.
+pub fn ping_once(addr: SocketAddr, timeout: Duration) -> Result<Duration, IcmpError> {
+    if addr.is_ipv6() {
+        return Err(IcmpError::Address);
+    }
+    let socket = match Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)) {
+        Ok(socket) => socket,
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            match Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+                Ok(socket) => socket,
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => return Err(IcmpError::Permission),
+                Err(_) => return Err(IcmpError::Socket),
+            }
+        }
+        Err(_) => return Err(IcmpError::Socket),
+    };
+    socket.set_read_timeout(Some(timeout)).map_err(|_| IcmpError::Socket)?;
+
+    // Changing every round, so a reply that arrives late for the previous one is not
+    // read as this one's.
+    let seq = (Instant::now().elapsed().subsec_nanos() % u32::from(u16::MAX)) as u16;
+    let packet = build_echo(std::process::id() as u16, seq);
+    let started = Instant::now();
+    socket.send_to(&packet, &addr.into()).map_err(|e| match e.kind() {
+        ErrorKind::PermissionDenied => IcmpError::Permission,
+        _ => IcmpError::Socket,
+    })?;
+
+    // `socket2` 0.6 takes `&mut [MaybeUninit<u8>]` here. The kernel writes `n` bytes and
+    // reports `n`, so reading exactly those as `u8` is sound; this is the only
+    // `unsafe` in the file.
+    let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1500];
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                let filled = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n) };
+                if parse_reply(filled).is_some_and(|(_, got)| got == seq) {
+                    return Ok(started.elapsed());
+                }
+            }
+            // The read timeout is how a missing reply shows up; anything else is the
+            // socket failing under us, which is also the end of this attempt.
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(IcmpError::Timeout)
+            }
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return Err(IcmpError::Permission),
+            Err(_) => return Err(IcmpError::Socket),
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    /// The whole point of telling the errors apart: the messages have to say which
+    /// one it was, because the operator reads them instead of a log.
+    #[test]
+    fn each_failure_says_which_one_it_was() {
+        assert!(IcmpError::Permission.to_string().contains("CAP_NET_RAW"));
+        assert!(IcmpError::Timeout.to_string().contains("timeout"));
+        assert_ne!(IcmpError::Permission, IcmpError::Timeout, "and they are not each other");
+    }
+
+    /// An IPv6 target is refused as an address problem, not reported as a loss: the
+    /// v6 message shape is the next step, and a silent 100% loss would be read as a
+    /// broken link.
+    #[test]
+    fn an_ipv6_target_is_refused_with_a_reason() {
+        let v6: SocketAddr = "[2606:4700:4700::1111]:0".parse().unwrap();
+        assert_eq!(ping_once(v6, Duration::from_millis(1)), Err(IcmpError::Address));
     }
 }
