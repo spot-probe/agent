@@ -137,6 +137,10 @@ struct PingTask {
     id: i64,
     target: String,
     interval: u64,
+    /// `"tcp"` (the default, and what a hub that predates this field means) or
+    /// `"icmp"`: an echo request instead of a TCP handshake.
+    #[serde(default)]
+    kind: String,
 }
 
 fn notify(method: &str, params: serde_json::Value) -> Message {
@@ -431,8 +435,9 @@ fn respawn_ping_tasks(
         wanted.truncate(MAX_PING_TASKS);
     }
     running.retain(|(task, handle)| {
-        let keep =
-            wanted.iter().any(|w| w.id == task.id && w.target == task.target && w.interval == task.interval);
+        let keep = wanted.iter().any(|w| {
+            w.id == task.id && w.target == task.target && w.interval == task.interval && w.kind == task.kind
+        });
         if !keep {
             handle.abort();
         }
@@ -455,6 +460,23 @@ fn respawn_ping_tasks(
             let mut said = false;
             loop {
                 ticker.tick().await;
+                if spawned.kind == "icmp" {
+                    // Reported either way, and the reason with it: a probe that cannot
+                    // run (no permission, no route) must not reach the chart looking
+                    // like a timeout. A hub that predates the field ignores `error`.
+                    let message = match icmp_ping(&spawned.target).await {
+                        Ok(rtt) => {
+                            serde_json::json!({"task_id": spawned.id, "latency_ms": rtt.as_millis() as i64})
+                        }
+                        Err(e) => serde_json::json!({
+                            "task_id": spawned.id, "latency_ms": null, "error": e.to_string()
+                        }),
+                    };
+                    if tx.send(notify("ping.result", message)).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let Some(latency) = tcp_ping(&spawned.target).await else {
                     if !std::mem::replace(&mut said, true) {
                         eprintln!(
@@ -475,6 +497,23 @@ fn respawn_ping_tasks(
         });
         running.push((task, handle));
     }
+}
+
+/// An ICMP echo, resolved and run the same way the TCP probe does it: the name is
+/// resolved **before** the clock starts, because resolution time is not latency and
+/// a resolver that overruns would otherwise be reported as a slow link.
+///
+/// `ping_once` blocks, so it runs on a blocking thread rather than growing an async
+/// socket layer in a binary whose runtime is single-threaded.
+async fn icmp_ping(target: &str) -> Result<Duration, icmp::IcmpError> {
+    let addr = tokio::net::lookup_host((target, 0))
+        .await
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .ok_or(icmp::IcmpError::Address)?;
+    tokio::task::spawn_blocking(move || icmp::ping_once(addr, HANDSHAKE_DEADLINE))
+        .await
+        .map_err(|_| icmp::IcmpError::Socket)?
 }
 
 /// Deadline for one handshake, deliberately under the kernel's first SYN
@@ -780,7 +819,8 @@ mod tests {
         let _g = rt.enter();
         let (tx, _rx) = mpsc::channel(8);
         let mut running = Vec::new();
-        let task = |id, target: &str, interval| PingTask { id, target: target.into(), interval };
+        let task =
+            |id, target: &str, interval| PingTask { id, target: target.into(), interval, kind: "tcp".into() };
 
         respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx);
         assert_eq!(running.len(), 2);
