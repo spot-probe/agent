@@ -14,9 +14,15 @@ use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-/// ICMPv6 is a later step; the v4 types are what this file speaks today.
 pub const ECHO_REQUEST: u8 = 8;
 pub const ECHO_REPLY: u8 = 0;
+/// ICMPv6's own numbers. Kept beside the v4 ones because `parse_reply_v6` must not
+/// accept a v4 reply and the other way round -- the types are what tell them apart.
+pub const ECHO_REQUEST_V6: u8 = 128;
+pub const ECHO_REPLY_V6: u8 = 129;
+
+/// The IPv6 pseudo-header's next-header value for ICMPv6 (RFC 4443).
+const ICMPV6_NEXT_HEADER: u8 = 58;
 
 /// One's complement of the one's complement sum of 16-bit big-endian words, with a
 /// trailing odd byte padded on the right -- the checksum both IP and ICMP use.
@@ -250,5 +256,96 @@ mod error_tests {
     fn an_ipv6_target_is_refused_with_a_reason() {
         let v6: SocketAddr = "[2606:4700:4700::1111]:0".parse().unwrap();
         assert_eq!(ping_once(v6, Duration::from_millis(1)), Err(IcmpError::Address));
+    }
+}
+
+/// The checksum of an ICMPv6 message, which unlike v4 covers a **pseudo-header**: the
+/// source and destination addresses, the upper-layer length and the next-header value.
+///
+/// Leaving the pseudo-header out is the classic v6 mistake: the message is well formed
+/// and every reply is dropped for a bad checksum, with nothing to say why.
+pub fn checksum6(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, message: &[u8]) -> u16 {
+    let mut framed = Vec::with_capacity(40 + message.len());
+    framed.extend_from_slice(&src.octets());
+    framed.extend_from_slice(&dst.octets());
+    framed.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&[0, 0, 0, ICMPV6_NEXT_HEADER]);
+    framed.extend_from_slice(message);
+    checksum(&framed)
+}
+
+/// An ICMPv6 echo request with its checksum filled in. Same shape as `build_echo`, and
+/// the same payload length, so a reply that is another probe's is as unlikely to match.
+pub fn build_echo6(id: u16, seq: u16, src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> Vec<u8> {
+    let mut packet = vec![ECHO_REQUEST_V6, 0, 0, 0];
+    packet.extend_from_slice(&id.to_be_bytes());
+    packet.extend_from_slice(&seq.to_be_bytes());
+    packet.extend_from_slice(b"monitor!");
+    let sum = checksum6(src, dst, &packet);
+    packet[2..4].copy_from_slice(&sum.to_be_bytes());
+    packet
+}
+
+/// The id and sequence of an **ICMPv6** echo reply, or `None` for anything else -- a v4
+/// reply included.
+///
+/// No header to skip: on both socket kinds the IPv6 header is stripped before delivery
+/// (`IPV6_CHECKSUM`/raw v6 differences are about who computes the checksum, not about
+/// what arrives here).
+pub fn parse_reply_v6(buf: &[u8]) -> Option<(u16, u16)> {
+    if buf.len() < 8 || buf[0] != ECHO_REPLY_V6 || buf[1] != 0 {
+        return None;
+    }
+    Some((u16::from_be_bytes([buf[4], buf[5]]), u16::from_be_bytes([buf[6], buf[7]])))
+}
+
+#[cfg(test)]
+mod v6_tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    fn addrs() -> (Ipv6Addr, Ipv6Addr) {
+        ("2606:4700:4700::1111".parse().unwrap(), "2606:4700:4700::1001".parse().unwrap())
+    }
+
+    /// The same self-checking property as v4, over the pseudo-header: a packet that
+    /// carries its own correct checksum verifies to zero when the pseudo-header is
+    /// included. This is what catches a checksum computed **without** it.
+    #[test]
+    fn a_v6_packet_with_its_checksum_filled_in_sums_to_zero() {
+        let (src, dst) = addrs();
+        let echo = build_echo6(0x1234, 9, src, dst);
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&src.octets());
+        framed.extend_from_slice(&dst.octets());
+        framed.extend_from_slice(&(echo.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&[0, 0, 0, ICMPV6_NEXT_HEADER]);
+        framed.extend_from_slice(&echo);
+        assert_eq!(checksum(&framed), 0, "the checksum it wrote must verify");
+        // And dropping the pseudo-header must **break** it: otherwise this test would
+        // pass on a checksum that ignored the addresses, which is the mistake above.
+        assert_ne!(checksum(&echo), 0, "the pseudo-header is part of it");
+    }
+
+    #[test]
+    fn a_v6_echo_request_says_what_it_is() {
+        let (src, dst) = addrs();
+        let echo = build_echo6(0xbeef, 0x0102, src, dst);
+        assert_eq!(echo[0], ECHO_REQUEST_V6, "type 128");
+        assert_eq!(echo[1], 0, "code 0");
+        assert_eq!(&echo[4..6], &[0xbe, 0xef]);
+        assert_eq!(&echo[6..8], &[0x01, 0x02]);
+        assert_eq!(echo.len(), 16);
+    }
+
+    /// The two families are told apart by their type numbers: a v4 reply has type 0 and
+    /// a v6 reply type 129, so neither reader may accept the other's packet.
+    #[test]
+    fn the_two_families_do_not_read_each_others_replies() {
+        let v6_reply = [ECHO_REPLY_V6, 0, 0x11, 0x22, 0xbe, 0xef, 0x01, 0x02];
+        assert_eq!(parse_reply_v6(&v6_reply), Some((0xbeef, 0x0102)));
+        assert_eq!(parse_reply(&v6_reply), None, "a v6 reply is not a v4 one");
+        let v4_reply = [ECHO_REPLY, 0, 0x11, 0x22, 0xbe, 0xef, 0x01, 0x02];
+        assert_eq!(parse_reply_v6(&v4_reply), None, "and the other way round");
     }
 }
