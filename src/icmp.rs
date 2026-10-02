@@ -221,7 +221,7 @@ pub enum IcmpError {
 impl std::fmt::Display for IcmpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
-            Self::Permission => "ICMP needs CAP_NET_RAW or a net.ipv4.ping_group_range                                  covering this agent's user",
+            Self::Permission => "ICMP needs CAP_NET_RAW, or a net.ipv4.ping_group_range covering this agent's user",
             Self::Timeout => "no echo reply within the timeout",
             Self::Socket => "the ICMP socket failed",
             Self::Address => "this probe speaks IPv4 only for now",
