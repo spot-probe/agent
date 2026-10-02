@@ -1,6 +1,10 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+// ICMP echo: pure packet handling and its tests. Not called yet -- the task's
+// `kind` reaches the hub first (see notes/plan-icmp-ping.md), so nothing uses it.
+#[allow(dead_code)]
+mod icmp;
 
 use std::time::Duration;
 
@@ -133,6 +137,10 @@ struct PingTask {
     id: i64,
     target: String,
     interval: u64,
+    /// `"tcp"` (the default, and what a hub that predates this field means) or
+    /// `"icmp"`: an echo request instead of a TCP handshake.
+    #[serde(default)]
+    kind: String,
 }
 
 fn notify(method: &str, params: serde_json::Value) -> Message {
@@ -174,8 +182,53 @@ fn remaining(last_frame: Instant) -> Duration {
     HUB_SILENCE.saturating_sub(last_frame.elapsed())
 }
 
+/// `--ping <host>`: one echo, and everything an operator needs to tell a **missing
+/// permission** from a **missing route** -- which look identical from the hub.
+///
+/// Blocking for at most the handshake deadline, in an async fn, on purpose: this is a
+/// command-line self-test that prints and exits, not a loop.
+async fn self_test(target: &str) -> Result<()> {
+    let addr = tokio::net::lookup_host((target, 0))
+        .await
+        .with_context(|| format!("cannot resolve {target}"))?
+        .next()
+        .with_context(|| format!("{target} resolved to no address"))?;
+    eprintln!("{target} resolves to {addr}");
+    eprintln!("sending an ICMP echo (unprivileged datagram socket first, raw as a fallback)");
+    match icmp::ping_once(addr, HANDSHAKE_DEADLINE) {
+        Ok(rtt) => {
+            eprintln!("echo reply in {} ms", rtt.as_millis());
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("no sample: {e}");
+            if e == icmp::IcmpError::Permission {
+                eprintln!(
+                    "  allow unprivileged ICMP (sysctl net.ipv4.ping_group_range) or give the \
+                     service CAP_NET_RAW -- see the docs for the unit file"
+                );
+            }
+            std::process::exit(1)
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Before `parse_args`, deliberately: a self-test needs neither a server nor a token,
+    // and `parse_args` refuses to go on without both. Checked here rather than as a flag
+    // inside it so that `Args` -- and every place that builds one -- stays as it is.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(at) = argv.iter().position(|a| a == "--ping") {
+        let host = match argv.get(at + 1) {
+            Some(host) => host.as_str(),
+            None => {
+                eprintln!("--ping needs a host, for example: monitor-agent --ping 1.1.1.1");
+                std::process::exit(2)
+            }
+        };
+        return self_test(host).await;
+    }
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
     // Reported once at startup. install.sh hardens this unit with
@@ -427,8 +480,9 @@ fn respawn_ping_tasks(
         wanted.truncate(MAX_PING_TASKS);
     }
     running.retain(|(task, handle)| {
-        let keep =
-            wanted.iter().any(|w| w.id == task.id && w.target == task.target && w.interval == task.interval);
+        let keep = wanted.iter().any(|w| {
+            w.id == task.id && w.target == task.target && w.interval == task.interval && w.kind == task.kind
+        });
         if !keep {
             handle.abort();
         }
@@ -451,6 +505,23 @@ fn respawn_ping_tasks(
             let mut said = false;
             loop {
                 ticker.tick().await;
+                if spawned.kind == "icmp" {
+                    // Reported either way, and the reason with it: a probe that cannot
+                    // run (no permission, no route) must not reach the chart looking
+                    // like a timeout. A hub that predates the field ignores `error`.
+                    let message = match icmp_ping(&spawned.target).await {
+                        Ok(rtt) => {
+                            serde_json::json!({"task_id": spawned.id, "latency_ms": rtt.as_millis() as i64})
+                        }
+                        Err(e) => serde_json::json!({
+                            "task_id": spawned.id, "latency_ms": null, "error": e.to_string()
+                        }),
+                    };
+                    if tx.send(notify("ping.result", message)).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let Some(latency) = tcp_ping(&spawned.target).await else {
                     if !std::mem::replace(&mut said, true) {
                         eprintln!(
@@ -471,6 +542,23 @@ fn respawn_ping_tasks(
         });
         running.push((task, handle));
     }
+}
+
+/// An ICMP echo, resolved and run the same way the TCP probe does it: the name is
+/// resolved **before** the clock starts, because resolution time is not latency and
+/// a resolver that overruns would otherwise be reported as a slow link.
+///
+/// `ping_once` blocks, so it runs on a blocking thread rather than growing an async
+/// socket layer in a binary whose runtime is single-threaded.
+async fn icmp_ping(target: &str) -> Result<Duration, icmp::IcmpError> {
+    let addr = tokio::net::lookup_host((target, 0))
+        .await
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .ok_or(icmp::IcmpError::Address)?;
+    tokio::task::spawn_blocking(move || icmp::ping_once(addr, HANDSHAKE_DEADLINE))
+        .await
+        .map_err(|_| icmp::IcmpError::Socket)?
 }
 
 /// Deadline for one handshake, deliberately under the kernel's first SYN
@@ -776,7 +864,8 @@ mod tests {
         let _g = rt.enter();
         let (tx, _rx) = mpsc::channel(8);
         let mut running = Vec::new();
-        let task = |id, target: &str, interval| PingTask { id, target: target.into(), interval };
+        let task =
+            |id, target: &str, interval| PingTask { id, target: target.into(), interval, kind: "tcp".into() };
 
         respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx);
         assert_eq!(running.len(), 2);
