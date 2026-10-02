@@ -33,7 +33,7 @@ jobs:
       # the hub and the themes read them, not only where they are serialized.
       - uses: actions/checkout@v7
         with:
-          repository: monitor-probe/monitor
+          repository: spot-probe/monitor
           path: hub
           sparse-checkout: scripts
       - run: cargo build
