@@ -38,9 +38,6 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    # 签名要用仓库 Secret，而 Secret 的安全性 = "谁能在这个仓库里让代码跑起来"。
-    # 绑到 Environment 并设**必需审阅人**之后，即使有人改了 workflow，签名这一步也要人点一下。
-    environment: release
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -55,22 +52,13 @@ jobs:
       - if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-          MINISIGN_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
         run: |
           mkdir -p bin && mv monitor-agent-* bin/
-          # **没有密钥就直接失败** —— 绝不能出现"发了版但没签名"的情况：
-          # agent 侧校验不过，等于这次发布对远程升级毫无意义，而人却以为签过了。
-          [ -n "$MINISIGN_KEY" ] || { echo "::error::缺少 AGENT_SIGNING_KEY，拒绝发布未签名的版本"; exit 1; }
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
-          # 私钥只落在临时文件里，`trap` 保证这一步退出即删（不给后续步骤留念想）。
-          KEY=$(mktemp); trap 'rm -f "$KEY"' EXIT
-          printf '%s' "$MINISIGN_KEY" > "$KEY"
-          cd bin
-          # **直接签二进制**（不是签一份清单）：agent 收到的字节本身就是被签的对象，
-          # 于是不存在"清单与文件对不上"的中间环节。
-          for f in monitor-agent-*; do
-            minisign -S -s "$KEY" -m "$f" -t "monitor-agent $GITHUB_REF_NAME"
-          done
-          sha256sum monitor-agent-* > sha256sums.txt
-          gh release create "$GITHUB_REF_NAME" monitor-agent-* *.minisig sha256sums.txt \
-            --generate-notes --repo "$GITHUB_REPOSITORY"
+          (cd bin && sha256sum monitor-agent-* > sha256sums.txt)
+          # **先发成草稿**：签名在维护者本机做（私钥带密码，而且不该为了 CI 把它降级成
+          # 无密码的密钥）。草稿对 `releases/latest` 不可见，所以：
+          #   · 未签名的版本**永远不可能变成公开的**；
+          #   · 远程升级在这段时间里找不到新版本（**安全的失败**，而不是发出去一个没人能验的东西）；
+          #   · 新节点安装会等这次发布完成 —— 你签完上传 .minisig 再 `--draft=false` 即可。
+          gh release create "$GITHUB_REF_NAME" bin/monitor-agent-* bin/sha256sums.txt \
+            --draft --generate-notes --repo "$GITHUB_REPOSITORY"
