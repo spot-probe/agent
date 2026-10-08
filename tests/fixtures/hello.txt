@@ -1,0 +1,1 @@
+monitor-agent signature fixture v1

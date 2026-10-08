@@ -66,4 +66,29 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         assert!(verify_bytes(b"anything", "not a signature").is_err());
         assert!(verify_bytes(b"anything", "").is_err());
     }
+
+    /// **正例：这条真实的签名必须被我们编进 agent 的那把公钥验过。**
+    ///
+    /// 夹具是维护者用自己的私钥、按发布流程里**同一条命令**签出来的：
+    /// `minisign -S -s ~/agent-signing-key.key -m tests/fixtures/hello.txt -t fixture`
+    /// —— 也就是说它证明了"**发布时怎么签**"与"**agent 怎么验**"这两端是通的，
+    /// 而这是整个远程升级方案里唯一必须绝对可靠的一环。
+    ///
+    /// 夹具入仓库无害：签名不是秘密，公钥本来就是公开的。而且这样一来，
+    /// **任何人 clone 下来跑 `cargo test` 都能独立确认这个信任根是自洽的**。
+    #[test]
+    fn the_real_signature_verifies() {
+        const DATA: &[u8] = include_bytes!("../tests/fixtures/hello.txt");
+        const SIG: &str = include_str!("../tests/fixtures/hello.txt.minisig");
+        verify_bytes(DATA, SIG).expect("维护者签的夹具必须验得过");
+    }
+
+    /// 而且**改一个字节就验不过** —— 否则"验签"只证明"有个签名在那儿"，证明不了内容没被动过。
+    #[test]
+    fn a_tampered_payload_is_rejected() {
+        const SIG: &str = include_str!("../tests/fixtures/hello.txt.minisig");
+        let mut tampered = include_bytes!("../tests/fixtures/hello.txt").to_vec();
+        tampered[0] ^= 0x01;
+        assert!(verify_bytes(&tampered, SIG).is_err(), "被改过一字节的内容必须验不过");
+    }
 }
