@@ -33,6 +33,23 @@ struct Args {
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
+    /// **只在安装时本机决定**：允许 hub 远程替换这台机器上的 agent 二进制。
+    ///
+    /// 默认关。打开也只是"允许"—— 每一份升级仍必须通过 `signing` 里的公钥验签才作数。
+    /// hub **无法**改写它（它不是设置项）：想开关只能在这台机器上重跑一次安装命令，
+    /// 因为安装脚本会把它写进 systemd unit 的 ExecStart。
+    allow_remote_upgrade: bool,
+}
+
+/// hello 的载荷：机器的事实 + **这台机器是否允许被远程升级**。
+///
+/// 后者不是"机器的属性"，所以不塞进 `Facts`；但它必须随 hello 一起上去 ——
+/// 否则面板上就分不出"可远程升级"和"仅手动升级"，而那正是三个月后最需要一眼看清的东西。
+fn hello_payload(mut v: serde_json::Value, allow_remote_upgrade: bool) -> serde_json::Value {
+    if let Some(o) = v.as_object_mut() {
+        o.insert("allow_remote_upgrade".into(), serde_json::json!(allow_remote_upgrade));
+    }
+    v
 }
 
 fn usage() -> ! {
@@ -48,14 +65,22 @@ fn usage() -> ! {
                                 from what would be counted. Full names only.\n  \
            --insecure           Allow plain ws:// to a remote hub; the token\n                       \
                                 travels in the clear. Only for a hub reached\n                       \
-                                at ip:port with no TLS in front.\n",
+                                at ip:port with no TLS in front.\n  \
+           --allow-remote-upgrade\n                       \
+                                **Let the hub replace this agent's binary**\n                       \
+                                (over wss only, and only if it verifies\n                       \
+                                against the key compiled into the agent).\n                       \
+                                Off by default: without it, upgrading this\n                       \
+                                machine means running the installer again\n                       \
+                                over SSH.\n",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
 }
 
 fn parse_args() -> Result<Args> {
-    let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, 1u64, None, false);
+    let (mut server, mut token, mut interval, mut iface, mut insecure, mut allow_remote_upgrade) =
+        (None, None, 1u64, None, false, false);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -65,6 +90,7 @@ fn parse_args() -> Result<Args> {
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--iface" => iface = Some(value()),
             "--insecure" => insecure = true,
+            "--allow-remote-upgrade" => allow_remote_upgrade = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
@@ -72,8 +98,11 @@ fn parse_args() -> Result<Args> {
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
     let iface = iface.or_else(|| std::env::var("MONITOR_IFACE").ok()).unwrap_or_default();
+    // 与其它三个一样给一个环境变量兜底：systemd unit 里两种写法都能用。
+    let allow_remote_upgrade = allow_remote_upgrade
+        || std::env::var("MONITOR_ALLOW_REMOTE_UPGRADE").is_ok_and(|v| v == "1" || v == "true");
     let ifaces = collect::Ifaces::parse(&iface).map_err(anyhow::Error::msg)?;
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure })
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure, allow_remote_upgrade })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -256,7 +285,16 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
+        if let Err(e) = session(
+            &url,
+            &args.token,
+            &mut collector,
+            args.interval,
+            &mut connected,
+            args.allow_remote_upgrade,
+        )
+        .await
+        {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -328,6 +366,7 @@ async fn session(
     collector: &mut Collector,
     interval: u64,
     connected: &mut Option<Instant>,
+    allow_remote_upgrade: bool,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
@@ -365,7 +404,12 @@ async fn session(
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
+    send(
+        &mut ws,
+        notify("hello", hello_payload(serde_json::to_value(&facts)?, allow_remote_upgrade)),
+        remaining(last_frame),
+    )
+    .await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -655,6 +699,16 @@ mod tests {
         assert_eq!(reconnect_wait(60, Duration::from_secs(3600)), 1);
         // Connected but dropped too early to prove anything: still a retreat.
         assert_eq!(reconnect_wait(4, Duration::from_secs(29)), 8);
+    }
+
+    /// **钉住"那个字段真的进了 hello"** —— 而不是靠"跑一次看看"。
+    /// 面板要能分出「可远程升级 / 仅手动升级」，靠的就是它在 hello 里如实上报。
+    #[test]
+    fn the_hello_carries_whether_remote_upgrade_is_allowed() {
+        let on = hello_payload(serde_json::json!({}), true);
+        let off = hello_payload(serde_json::json!({}), false);
+        assert_eq!(on["allow_remote_upgrade"], serde_json::json!(true));
+        assert_eq!(off["allow_remote_upgrade"], serde_json::json!(false));
     }
 
     #[test]
