@@ -5,6 +5,7 @@ mod collect;
 // `kind` reaches the hub first (see notes/plan-icmp-ping.md), so nothing uses it.
 #[allow(dead_code)]
 mod icmp;
+mod signing;
 
 use std::time::Duration;
 
