@@ -6,6 +6,7 @@ mod collect;
 #[allow(dead_code)]
 mod icmp;
 mod signing;
+mod upgrade;
 
 use std::time::Duration;
 
@@ -403,6 +404,10 @@ async fn session(
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
+    // 升级收集器与"这条连接可不可信"。可信 = wss，或 loopback 上的明文
+    // （loopback 上没有中间人；非 loopback 的明文一律不接受升级）。
+    let mut up = upgrade::State::default();
+    let secure = url.starts_with("wss://") || is_loopback(url);
 
     send(
         &mut ws,
@@ -438,10 +443,37 @@ async fn session(
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
-                            if rpc.method == "ping.tasks" {
+                            // **先**处理升级：下面 `ping.tasks` 那一支会把 `rpc.params` 移走。
+                            if rpc.method == "upgrade.verify" {
+                                match up.text(&rpc.params, allow_remote_upgrade, secure) {
+                                    Some(upgrade::Step::Collecting(n)) => eprintln!("upgrade: expecting {n} bytes"),
+                                    Some(upgrade::Step::Reject(why)) => {
+                                        eprintln!("upgrade refused: {why}");
+                                        if let Ok(m) = upgrade::report(false, &why, "") {
+                                            let _ = result_tx.try_send(m);
+                                        }
+                                    }
+                                    Some(upgrade::Step::Done { ok, reason, version }) => {
+                                        eprintln!("upgrade {}: {reason}", if ok { "verified" } else { "FAILED" });
+                                        if let Ok(m) = upgrade::report(ok, &reason, &version) {
+                                            let _ = result_tx.try_send(m);
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            } else if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
                                 }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        // 没有进行中的升级时返回 None —— 与从前一样被忽略。
+                        if let Some(upgrade::Step::Done { ok, reason, version }) = up.binary(&bytes) {
+                            eprintln!("upgrade {}: {reason}", if ok { "verified" } else { "FAILED" });
+                            if let Ok(m) = upgrade::report(ok, &reason, &version) {
+                                let _ = result_tx.try_send(m);
                             }
                         }
                     }
