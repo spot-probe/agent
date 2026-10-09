@@ -68,7 +68,8 @@ fn finish_upgrade(ok: bool, apply_ready: bool, version: &str, reason: &str, tx: 
     if !(ok && apply_ready) {
         return;
     }
-    match apply::Plan::current().and_then(|p| apply::commit(&p)) {
+    // 交给 `commit` 的是"**即将被换下**的那个版本" = 现在运行着的这一个。
+    match apply::Plan::current().and_then(|p| apply::commit(&p, env!("CARGO_PKG_VERSION"))) {
         Ok(()) => {
             eprintln!("已换上 {version}：退出，让 systemd 拉起新版本（启动后会自检）");
             tokio::spawn(async {
@@ -104,7 +105,12 @@ fn self_check_after_upgrade() {
         Ok(p) if apply::pending(&p) => p,
         _ => return,
     };
-    eprintln!("刚升级过：{} 秒内连不上 hub 就回滚到 {}", SELF_CHECK.as_secs(), plan.prev.display());
+    match apply::marker_versions(&plan) {
+        Some((from, to)) => {
+            eprintln!("刚升级过（{from} → {to}）：{} 秒内连不上 hub 就回滚", SELF_CHECK.as_secs())
+        }
+        None => eprintln!("刚升级过：{} 秒内连不上 hub 就回滚", SELF_CHECK.as_secs()),
+    }
     tokio::spawn(async move {
         tokio::time::sleep(SELF_CHECK).await;
         if EVER_CONNECTED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -115,7 +121,12 @@ fn self_check_after_upgrade() {
         }
         match apply::rollback(&plan) {
             Ok(()) => {
-                eprintln!("自检失败：连不上 hub，已回滚；退出让 systemd 拉起旧版本");
+                // 到这里 marker 已被 `rollback` 清掉，所以这行只能写"回到换之前那一版"；
+                // 具体的两个版本号在**启动那行**日志里（那时 marker 还在）。
+                eprintln!(
+                    "自检失败：{} 秒内连不上 hub，已回滚到换之前那一版；退出让 systemd 拉起它",
+                    SELF_CHECK.as_secs()
+                );
                 std::process::exit(1);
             }
             // 没有退路时**必须响**：这台机器现在只剩 SSH 这一条路。
