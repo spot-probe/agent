@@ -117,14 +117,21 @@ pub fn clear_marker(plan: &Plan) {
 mod tests {
     use super::*;
 
+    /// 每个测试一个**唯一**目录。
+    ///
+    /// 一开始用 `SystemTime::subsec_nanos()`：macOS 上它只有微秒级，而这几条测试是**并行**跑的
+    /// —— 两个测试可能撞进同一个目录、互相覆盖文件，于是出现"单独跑都过、一起跑偶尔红"的 flaky。
+    /// 原子计数器没有这个问题。
     fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("apply-{}-{}", std::process::id(), rand()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "apply-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&d).unwrap();
         d
-    }
-    fn rand() -> u64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64
     }
     fn setup() -> (PathBuf, Plan) {
         let d = tmp();

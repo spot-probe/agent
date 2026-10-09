@@ -45,6 +45,8 @@ pub struct Pending {
     pub version: String,
     pub sig: String,
     pub size: usize,
+    /// 验过之后**要不要真的换上去**。hub 在公告里说明它的意图；false 就只验不换。
+    pub apply: bool,
 }
 
 /// 状态机每一步的产出。`None` 表示"这条帧与我无关"。
@@ -55,7 +57,7 @@ pub enum Step {
     /// 拒绝，附上给 hub 的原因。
     Reject(String),
     /// 有结论了（验过、或中途失败）。**自带 version**，于是回报时不必再去别处找它。
-    Done { ok: bool, reason: String, version: String },
+    Done { ok: bool, reason: String, version: String, apply: bool },
 }
 
 #[derive(Default)]
@@ -92,7 +94,8 @@ impl State {
                 env!("CARGO_PKG_VERSION")
             )));
         }
-        self.open = Some((Pending { version, sig, size }, Vec::with_capacity(size.min(1 << 20))));
+        let apply = params.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+        self.open = Some((Pending { version, sig, size, apply }, Vec::with_capacity(size.min(1 << 20))));
         Some(Step::Collecting(size))
     }
 
@@ -101,9 +104,10 @@ impl State {
         let (pending, buf) = self.open.as_mut()?;
         if buf.len() + data.len() > pending.size {
             let version = pending.version.clone();
+            let apply = pending.apply;
             self.open = None;
             return Some(Step::Done {
-                ok: false, reason: "收到的字节多于公告的长度".into(), version
+                ok: false, reason: "收到的字节多于公告的长度".into(), version, apply
             });
         }
         buf.extend_from_slice(data);
@@ -111,23 +115,50 @@ impl State {
             return Some(Step::Collecting(pending.size - buf.len()));
         }
         let (pending, buf) = self.open.take().expect("刚判断过是 Some");
-        let outcome = self.finish(&pending, &buf);
+        let mut outcome = self.finish(&pending, &buf);
+        // **字节还在这儿的时候先把新版本暂存好**：`Step` 不携带那几 MB（它派生了 `Debug`，
+        // 一次 `{:?}` 就会倾倒出来），而 `main` 拿到结论时 `buf` 已经不在了。
+        // 暂存**不动正在运行的那个** —— 危险的 `commit`（rename）留在 `main`，看门就在那一层。
+        if let Step::Done { ok: true, apply: true, ref mut reason, .. } = outcome {
+            match crate::apply::Plan::current() {
+                Ok(plan) => match crate::apply::stage(&plan, &buf) {
+                    Ok(()) => *reason = format!("{reason}；已暂存 {}", plan.staged.display()),
+                    Err(e) => {
+                        return Some(self.fail(format!("{reason}；但暂存失败：{e:#}")));
+                    }
+                },
+                Err(e) => return Some(self.fail(format!("{reason}；但找不到自己的路径：{e:#}"))),
+            }
+        }
         Some(outcome)
     }
 
-    /// 收齐之后的收尾：验签 → **不落盘** → 给出结论。
+    /// 把结论降级成失败（暂存失败时用）。`apply` 置 false：没暂存好就绝不去 commit。
+    fn fail(&self, reason: String) -> Step {
+        Step::Done { ok: false, reason, version: String::new(), apply: false }
+    }
+
+    /// 收齐之后的收尾：**验签**，然后给出结论。
     ///
-    /// 刻意**只验不写**：这一期的价值是"证明 hub 能推、agent 能验"，不是换二进制。
+    /// **这里仍然只验不写**：真正换二进制由 `main` 在拿到结论之后做（`apply` 为真且 `ok`）。
+    /// 分开是有意的 —— 这个状态机是纯的、可单测的，而"改写自己的二进制"要留在能被
+    /// 看门兜住的那一层做。
     fn finish(&self, pending: &Pending, buf: &[u8]) -> Step {
-        // 结论自带 version：回报时不必再去别处找它。
+        // 结论自带 version 与 apply：回报与后续动作都不必再去别处找它们。
         let version = pending.version.clone();
+        let apply = pending.apply;
         match signing::verify_bytes(buf, &pending.sig) {
             Ok(()) => Step::Done {
                 ok: true,
-                reason: format!("签名校验通过（{} 字节，未替换）", buf.len()),
+                reason: if apply {
+                    format!("签名校验通过（{} 字节），即将替换", buf.len())
+                } else {
+                    format!("签名校验通过（{} 字节，未替换）", buf.len())
+                },
                 version,
+                apply,
             },
-            Err(e) => Step::Done { ok: false, reason: format!("签名校验失败：{e}"), version },
+            Err(e) => Step::Done { ok: false, reason: format!("签名校验失败：{e}"), version, apply },
         }
     }
 

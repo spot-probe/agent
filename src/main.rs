@@ -54,6 +54,33 @@ fn hello_payload(mut v: serde_json::Value, allow_remote_upgrade: bool) -> serde_
     v
 }
 
+/// 拿到结论之后的收尾：**回报**，并在"验过且要求换"时真正**换上去**。
+///
+/// 暂存已经在 `upgrade::binary` 里做过（那时那几 MB 还在手上）；这里只做**危险的 rename**。
+/// 回报**先排队**、然后延迟退出 —— 直接 `exit` 会把还没写到 socket 上的回报丢掉，而
+/// "换了但没有回报"正是最让人瞎的一种结果。退出交给 systemd（`Restart=always`）拉起新版本，
+/// 新版本启动时会走 `self_check_after_upgrade`，连不上 hub 就回滚。
+fn finish_upgrade(ok: bool, apply_ready: bool, version: &str, reason: &str, tx: &mpsc::Sender<Message>) {
+    eprintln!("upgrade {}: {reason}", if ok { "verified" } else { "FAILED" });
+    if let Ok(m) = upgrade::report(ok, reason, version) {
+        let _ = tx.try_send(m);
+    }
+    if !(ok && apply_ready) {
+        return;
+    }
+    match apply::Plan::current().and_then(|p| apply::commit(&p)) {
+        Ok(()) => {
+            eprintln!("已换上 {version}：退出，让 systemd 拉起新版本（启动后会自检）");
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                std::process::exit(0);
+            });
+        }
+        // 换失败时 `apply::commit` 已经把退路放回去了 —— 旧版本仍在运行，什么都没变。
+        Err(e) => eprintln!("换上失败：{e:#} —— 仍在运行旧版本，未替换"),
+    }
+}
+
 /// 升级后的自检窗口。
 ///
 /// **它必须大于 agent 自己的连接预算**（`CONNECT_DEADLINE` = 120 秒）—— 否则一个正在
@@ -502,11 +529,8 @@ async fn session(
                                             let _ = result_tx.try_send(m);
                                         }
                                     }
-                                    Some(upgrade::Step::Done { ok, reason, version }) => {
-                                        eprintln!("upgrade {}: {reason}", if ok { "verified" } else { "FAILED" });
-                                        if let Ok(m) = upgrade::report(ok, &reason, &version) {
-                                            let _ = result_tx.try_send(m);
-                                        }
+                                    Some(upgrade::Step::Done { ok, reason, version, apply }) => {
+                                        finish_upgrade(ok, apply, &version, &reason, &result_tx);
                                     }
                                     None => {}
                                 }
@@ -519,11 +543,8 @@ async fn session(
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         // 没有进行中的升级时返回 None —— 与从前一样被忽略。
-                        if let Some(upgrade::Step::Done { ok, reason, version }) = up.binary(&bytes) {
-                            eprintln!("upgrade {}: {reason}", if ok { "verified" } else { "FAILED" });
-                            if let Ok(m) = upgrade::report(ok, &reason, &version) {
-                                let _ = result_tx.try_send(m);
-                            }
+                        if let Some(upgrade::Step::Done { ok, reason, version, apply }) = up.binary(&bytes) {
+                            finish_upgrade(ok, apply, &version, &reason, &result_tx);
                         }
                     }
                     // Ping included: tungstenite queues the pong itself and
