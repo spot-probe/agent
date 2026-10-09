@@ -54,6 +54,49 @@ fn hello_payload(mut v: serde_json::Value, allow_remote_upgrade: bool) -> serde_
     v
 }
 
+/// 升级后的自检窗口。
+///
+/// **它必须大于 agent 自己的连接预算**（`CONNECT_DEADLINE` = 120 秒）—— 否则一个正在
+/// **合法地重试连接**的 agent（网络慢、或 hub 刚在重启）会被自己的看门判成"起不来"并回滚，
+/// 那是最糟的一种误伤。180 秒 = 120 秒 + 一次握手的余量。
+const SELF_CHECK: Duration = Duration::from_secs(180);
+
+/// 本次进程是否**至少成功连上过一次** hub。自检看的就是它。
+static EVER_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 换过自身二进制之后的自检：**第一次启动必须能重新连上 hub**，连不上就回滚。
+///
+/// **惰性**：只有 `.pending` marker 存在时才动手，而 marker 只由 `apply::commit` 写下 ——
+/// 也就是说，在还没有人真正按下替换之前，这个函数**什么都不做**。
+///
+/// 回滚之后**退出**，让 systemd（`install.sh` 写的是 `Restart=always`）拉起旧版本；
+/// 旧版本启动时没有 marker，于是它不会再回滚，也会正常连上 hub —— 从面板上看就是
+/// 版本退了回去，那正是"这次升级失败了"的可观测证据。
+fn self_check_after_upgrade() {
+    let plan = match apply::Plan::current() {
+        Ok(p) if apply::pending(&p) => p,
+        _ => return,
+    };
+    eprintln!("刚升级过：{} 秒内连不上 hub 就回滚到 {}", SELF_CHECK.as_secs(), plan.prev.display());
+    tokio::spawn(async move {
+        tokio::time::sleep(SELF_CHECK).await;
+        if EVER_CONNECTED.load(std::sync::atomic::Ordering::Relaxed) {
+            // 自证通过：清掉 marker，此后不再回滚（但 `.prev` 留着，下次升级还要用）。
+            apply::clear_marker(&plan);
+            eprintln!("自检通过：已连上 hub，这次升级成立");
+            return;
+        }
+        match apply::rollback(&plan) {
+            Ok(()) => {
+                eprintln!("自检失败：连不上 hub，已回滚；退出让 systemd 拉起旧版本");
+                std::process::exit(1);
+            }
+            // 没有退路时**必须响**：这台机器现在只剩 SSH 这一条路。
+            Err(e) => eprintln!("自检失败，且回滚失败：{e:#} —— 这台机器需要 SSH"),
+        }
+    });
+}
+
 fn usage() -> ! {
     eprintln!(
         "monitor-agent {}\n\n\
@@ -250,6 +293,9 @@ async fn main() -> Result<()> {
     // Before `parse_args`, deliberately: a self-test needs neither a server nor a token,
     // and `parse_args` refuses to go on without both. Checked here rather than as a flag
     // inside it so that `Args` -- and every place that builds one -- stays as it is.
+    // **放在最前面**（`parse_args` 之前）：一个换上去的二进制如果连参数都解析不了，
+    // 会在这里就被看门兜住，而不是留下一个永远起不来的服务。
+    self_check_after_upgrade();
     let argv: Vec<String> = std::env::args().collect();
     if let Some(at) = argv.iter().position(|a| a == "--ping") {
         let host = match argv.get(at + 1) {
@@ -402,6 +448,8 @@ async fn session(
         .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
     eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
+    // 自检只问一件事：**这次启动有没有连上过**。置了就永远不会回滚。
+    EVER_CONNECTED.store(true, std::sync::atomic::Ordering::Relaxed);
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
