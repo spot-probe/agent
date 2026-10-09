@@ -503,6 +503,18 @@ async fn session(
     )
     .await?;
 
+    // **换过自身二进制之后第一次连上 hub —— 这就是"升级成立"的证据**，立刻报回去并清掉
+    // marker（此后不再回滚）。刻意不等到那 180 秒的看门：成功该多快知道就多快知道，
+    // 而看门只负责另一半（连不上就回滚）。清 marker 是幂等的，看门到点再清一次也无害。
+    if let Ok(plan) = apply::Plan::current() {
+        if apply::pending(&plan) {
+            let v = env!("CARGO_PKG_VERSION");
+            let note = format!("升级到 {v} 已生效（连上 hub，自检通过）");
+            apply::clear_marker(&plan);
+            send(&mut ws, upgrade::report(true, &note, v)?, remaining(last_frame)).await?;
+        }
+    }
+
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
