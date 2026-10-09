@@ -25,6 +25,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # unprivileged datagram one.
 socket2 = { version = "0.6", features = ["all"] }
 if-addrs = "0.15.0"
+minisign-verify = "0.3.0"
 
 [dev-dependencies]
 # Only the tests need a movable clock; the write-deadline arithmetic spans

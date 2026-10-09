@@ -3,8 +3,11 @@
 mod collect;
 // ICMP echo: pure packet handling and its tests. Not called yet -- the task's
 // `kind` reaches the hub first (see notes/plan-icmp-ping.md), so nothing uses it.
+mod apply;
 #[allow(dead_code)]
 mod icmp;
+mod signing;
+mod upgrade;
 
 use std::time::Duration;
 
@@ -32,6 +35,93 @@ struct Args {
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
+    /// **只在安装时本机决定**：允许 hub 远程替换这台机器上的 agent 二进制。
+    ///
+    /// 默认关。打开也只是"允许"—— 每一份升级仍必须通过 `signing` 里的公钥验签才作数。
+    /// hub **无法**改写它（它不是设置项）：想开关只能在这台机器上重跑一次安装命令，
+    /// 因为安装脚本会把它写进 systemd unit 的 ExecStart。
+    allow_remote_upgrade: bool,
+}
+
+/// hello 的载荷：机器的事实 + **这台机器是否允许被远程升级**。
+///
+/// 后者不是"机器的属性"，所以不塞进 `Facts`；但它必须随 hello 一起上去 ——
+/// 否则面板上就分不出"可远程升级"和"仅手动升级"，而那正是三个月后最需要一眼看清的东西。
+fn hello_payload(mut v: serde_json::Value, allow_remote_upgrade: bool) -> serde_json::Value {
+    if let Some(o) = v.as_object_mut() {
+        o.insert("allow_remote_upgrade".into(), serde_json::json!(allow_remote_upgrade));
+    }
+    v
+}
+
+/// 拿到结论之后的收尾：**回报**，并在"验过且要求换"时真正**换上去**。
+///
+/// 暂存已经在 `upgrade::binary` 里做过（那时那几 MB 还在手上）；这里只做**危险的 rename**。
+/// 回报**先排队**、然后延迟退出 —— 直接 `exit` 会把还没写到 socket 上的回报丢掉，而
+/// "换了但没有回报"正是最让人瞎的一种结果。退出交给 systemd（`Restart=always`）拉起新版本，
+/// 新版本启动时会走 `self_check_after_upgrade`，连不上 hub 就回滚。
+fn finish_upgrade(ok: bool, apply_ready: bool, version: &str, reason: &str, tx: &mpsc::Sender<Message>) {
+    eprintln!("upgrade {}: {reason}", if ok { "verified" } else { "FAILED" });
+    if let Ok(m) = upgrade::report(ok, reason, version) {
+        let _ = tx.try_send(m);
+    }
+    if !(ok && apply_ready) {
+        return;
+    }
+    match apply::Plan::current().and_then(|p| apply::commit(&p)) {
+        Ok(()) => {
+            eprintln!("已换上 {version}：退出，让 systemd 拉起新版本（启动后会自检）");
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                std::process::exit(0);
+            });
+        }
+        // 换失败时 `apply::commit` 已经把退路放回去了 —— 旧版本仍在运行，什么都没变。
+        Err(e) => eprintln!("换上失败：{e:#} —— 仍在运行旧版本，未替换"),
+    }
+}
+
+/// 升级后的自检窗口。
+///
+/// **它必须大于 agent 自己的连接预算**（`CONNECT_DEADLINE` = 120 秒）—— 否则一个正在
+/// **合法地重试连接**的 agent（网络慢、或 hub 刚在重启）会被自己的看门判成"起不来"并回滚，
+/// 那是最糟的一种误伤。180 秒 = 120 秒 + 一次握手的余量。
+const SELF_CHECK: Duration = Duration::from_secs(180);
+
+/// 本次进程是否**至少成功连上过一次** hub。自检看的就是它。
+static EVER_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 换过自身二进制之后的自检：**第一次启动必须能重新连上 hub**，连不上就回滚。
+///
+/// **惰性**：只有 `.pending` marker 存在时才动手，而 marker 只由 `apply::commit` 写下 ——
+/// 也就是说，在还没有人真正按下替换之前，这个函数**什么都不做**。
+///
+/// 回滚之后**退出**，让 systemd（`install.sh` 写的是 `Restart=always`）拉起旧版本；
+/// 旧版本启动时没有 marker，于是它不会再回滚，也会正常连上 hub —— 从面板上看就是
+/// 版本退了回去，那正是"这次升级失败了"的可观测证据。
+fn self_check_after_upgrade() {
+    let plan = match apply::Plan::current() {
+        Ok(p) if apply::pending(&p) => p,
+        _ => return,
+    };
+    eprintln!("刚升级过：{} 秒内连不上 hub 就回滚到 {}", SELF_CHECK.as_secs(), plan.prev.display());
+    tokio::spawn(async move {
+        tokio::time::sleep(SELF_CHECK).await;
+        if EVER_CONNECTED.load(std::sync::atomic::Ordering::Relaxed) {
+            // 自证通过：清掉 marker，此后不再回滚（但 `.prev` 留着，下次升级还要用）。
+            apply::clear_marker(&plan);
+            eprintln!("自检通过：已连上 hub，这次升级成立");
+            return;
+        }
+        match apply::rollback(&plan) {
+            Ok(()) => {
+                eprintln!("自检失败：连不上 hub，已回滚；退出让 systemd 拉起旧版本");
+                std::process::exit(1);
+            }
+            // 没有退路时**必须响**：这台机器现在只剩 SSH 这一条路。
+            Err(e) => eprintln!("自检失败，且回滚失败：{e:#} —— 这台机器需要 SSH"),
+        }
+    });
 }
 
 fn usage() -> ! {
@@ -47,14 +137,22 @@ fn usage() -> ! {
                                 from what would be counted. Full names only.\n  \
            --insecure           Allow plain ws:// to a remote hub; the token\n                       \
                                 travels in the clear. Only for a hub reached\n                       \
-                                at ip:port with no TLS in front.\n",
+                                at ip:port with no TLS in front.\n  \
+           --allow-remote-upgrade\n                       \
+                                **Let the hub replace this agent's binary**\n                       \
+                                (over wss only, and only if it verifies\n                       \
+                                against the key compiled into the agent).\n                       \
+                                Off by default: without it, upgrading this\n                       \
+                                machine means running the installer again\n                       \
+                                over SSH.\n",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
 }
 
 fn parse_args() -> Result<Args> {
-    let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, 1u64, None, false);
+    let (mut server, mut token, mut interval, mut iface, mut insecure, mut allow_remote_upgrade) =
+        (None, None, 1u64, None, false, false);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -64,6 +162,7 @@ fn parse_args() -> Result<Args> {
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--iface" => iface = Some(value()),
             "--insecure" => insecure = true,
+            "--allow-remote-upgrade" => allow_remote_upgrade = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
@@ -71,8 +170,11 @@ fn parse_args() -> Result<Args> {
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
     let iface = iface.or_else(|| std::env::var("MONITOR_IFACE").ok()).unwrap_or_default();
+    // 与其它三个一样给一个环境变量兜底：systemd unit 里两种写法都能用。
+    let allow_remote_upgrade = allow_remote_upgrade
+        || std::env::var("MONITOR_ALLOW_REMOTE_UPGRADE").is_ok_and(|v| v == "1" || v == "true");
     let ifaces = collect::Ifaces::parse(&iface).map_err(anyhow::Error::msg)?;
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure })
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure, allow_remote_upgrade })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -218,6 +320,9 @@ async fn main() -> Result<()> {
     // Before `parse_args`, deliberately: a self-test needs neither a server nor a token,
     // and `parse_args` refuses to go on without both. Checked here rather than as a flag
     // inside it so that `Args` -- and every place that builds one -- stays as it is.
+    // **放在最前面**（`parse_args` 之前）：一个换上去的二进制如果连参数都解析不了，
+    // 会在这里就被看门兜住，而不是留下一个永远起不来的服务。
+    self_check_after_upgrade();
     let argv: Vec<String> = std::env::args().collect();
     if let Some(at) = argv.iter().position(|a| a == "--ping") {
         let host = match argv.get(at + 1) {
@@ -255,7 +360,16 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
+        if let Err(e) = session(
+            &url,
+            &args.token,
+            &mut collector,
+            args.interval,
+            &mut connected,
+            args.allow_remote_upgrade,
+        )
+        .await
+        {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -327,6 +441,7 @@ async fn session(
     collector: &mut Collector,
     interval: u64,
     connected: &mut Option<Instant>,
+    allow_remote_upgrade: bool,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
@@ -360,11 +475,22 @@ async fn session(
         .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
     eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
+    // 自检只问一件事：**这次启动有没有连上过**。置了就永远不会回滚。
+    EVER_CONNECTED.store(true, std::sync::atomic::Ordering::Relaxed);
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
+    // 升级收集器与"这条连接可不可信"。可信 = wss，或 loopback 上的明文
+    // （loopback 上没有中间人；非 loopback 的明文一律不接受升级）。
+    let mut up = upgrade::State::default();
+    let secure = url.starts_with("wss://") || is_loopback(url);
 
-    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
+    send(
+        &mut ws,
+        notify("hello", hello_payload(serde_json::to_value(&facts)?, allow_remote_upgrade)),
+        remaining(last_frame),
+    )
+    .await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -393,11 +519,32 @@ async fn session(
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
-                            if rpc.method == "ping.tasks" {
+                            // **先**处理升级：下面 `ping.tasks` 那一支会把 `rpc.params` 移走。
+                            if rpc.method == "upgrade.verify" {
+                                match up.text(&rpc.params, allow_remote_upgrade, secure) {
+                                    Some(upgrade::Step::Collecting(n)) => eprintln!("upgrade: expecting {n} bytes"),
+                                    Some(upgrade::Step::Reject(why)) => {
+                                        eprintln!("upgrade refused: {why}");
+                                        if let Ok(m) = upgrade::report(false, &why, "") {
+                                            let _ = result_tx.try_send(m);
+                                        }
+                                    }
+                                    Some(upgrade::Step::Done { ok, reason, version, apply }) => {
+                                        finish_upgrade(ok, apply, &version, &reason, &result_tx);
+                                    }
+                                    None => {}
+                                }
+                            } else if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
                                 }
                             }
+                        }
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        // 没有进行中的升级时返回 None —— 与从前一样被忽略。
+                        if let Some(upgrade::Step::Done { ok, reason, version, apply }) = up.binary(&bytes) {
+                            finish_upgrade(ok, apply, &version, &reason, &result_tx);
                         }
                     }
                     // Ping included: tungstenite queues the pong itself and
@@ -654,6 +801,16 @@ mod tests {
         assert_eq!(reconnect_wait(60, Duration::from_secs(3600)), 1);
         // Connected but dropped too early to prove anything: still a retreat.
         assert_eq!(reconnect_wait(4, Duration::from_secs(29)), 8);
+    }
+
+    /// **钉住"那个字段真的进了 hello"** —— 而不是靠"跑一次看看"。
+    /// 面板要能分出「可远程升级 / 仅手动升级」，靠的就是它在 hello 里如实上报。
+    #[test]
+    fn the_hello_carries_whether_remote_upgrade_is_allowed() {
+        let on = hello_payload(serde_json::json!({}), true);
+        let off = hello_payload(serde_json::json!({}), false);
+        assert_eq!(on["allow_remote_upgrade"], serde_json::json!(true));
+        assert_eq!(off["allow_remote_upgrade"], serde_json::json!(false));
     }
 
     #[test]
