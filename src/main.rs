@@ -3,6 +3,7 @@
 mod collect;
 // ICMP echo: pure packet handling and its tests. Not called yet -- the task's
 // `kind` reaches the hub first (see notes/plan-icmp-ping.md), so nothing uses it.
+mod apply;
 #[allow(dead_code)]
 mod icmp;
 mod signing;
