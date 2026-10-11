@@ -83,6 +83,43 @@ fn netflix_region(page: &str) -> Option<String> {
     }
 }
 
+// ─────────────────────────── 状态：上次探测时间（落盘，或如实降级）───────────────────────────
+
+/// 状态目录从**环境**里认出来 ✓ —— 纯函数 ✓（所以"拿不到目录"这条路能测 ✓）。
+///
+/// ⚠️ 为什么不是写死的路径 ✗：unit 里是 `ProtectSystem=strict` ✓，
+/// 除非 `StateDirectory=` 声明过 ✓，服务**哪个目录都写不了** ✓✗（连 /tmp 都被 PrivateTmp 挡掉 ✓）。
+/// systemd 声明过之后会把路径放进 **`$STATE_DIRECTORY`** ✓✓ ⇒ 以它为准 ✓。
+/// 拿不到（老安装 ✓ / 手动跑 ✓）⇒ `None` ✓ ⇒ 调用方**如实降级到内存** ✓，
+/// **不假装写成功** ✗（假装的话，"重启不风暴"会在最需要它的时候失效 ✓✗）。
+pub fn state_dir(env: Option<&str>) -> Option<std::path::PathBuf> {
+    let raw = env?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // systemd 可以给**多个**目录（冒号分隔 ✓，与 PATH 同一个约定 ✓）—— 取第一个 ✓。
+    // ⚠️ **空段要跳过** ✗（与 PATH 同一条约定 ✓）：`":/run/x"` 的第一段是空串 ✓，
+    // 若直接取它 ⇒ 返回 None ✓✗ —— 于是**明明有可用目录，却降级到内存** ✓
+    //（"重启不风暴"在最需要它的时候失效 ✓）。这条是测试抓出来的 ✓：我原本就是那么写的 ✓。
+    let first = raw.split(':').map(str::trim).find(|seg| !seg.is_empty())?;
+    Some(std::path::PathBuf::from(first))
+}
+
+/// 上次探测时间的落盘格式 ✓ —— **Unix 秒** ✓（一行数字 ✓）。
+/// ⚠️ 纯函数 ✓：读不出来就 `None` ✓（文件被截断 ✓、被改坏 ✓、是老版本写的 ✓）
+/// —— **不猜** ✗（猜一个时间会让周期算错 ✓，而错的方向可能是"立刻又探一次" ✓✗）。
+pub fn parse_stamp(text: &str) -> Option<std::time::SystemTime> {
+    let secs: u64 = text.trim().parse().ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
+/// 与 [`parse_stamp`] 配对的写出格式 ✓（纯函数 ✓ ⇒ 两个方向都能测 ✓）。
+pub fn format_stamp(t: std::time::SystemTime) -> Option<String> {
+    // 早于 Unix 纪元 ⇒ 写不出来 ✓（那种值本来就不该出现 ✓；写一个 0 会被读成"1970 年探过" ✓✗）
+    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some(secs.to_string())
+}
+
 // ───────────────────────────── 排程（纯函数，策略只在这里一处）─────────────────────────────
 
 /// 每隔多久探一次 ✓（用户定的：**6 小时** ✓）。
@@ -376,5 +413,39 @@ mod tests {
         uniq.sort_unstable();
         uniq.dedup();
         assert!(uniq.len() >= 4, "8 个连号 seed 至少该散到 4 个不同的小时里（实际 {hours:?}）✓");
+    }
+    /// 状态目录：systemd 给就用它 ✓；没给 / 空 ⇒ `None` ✓（调用方据此**如实降级** ✓，
+    /// 而不是写到一个写不了的地方然后失败 ✓）。
+    #[test]
+    fn the_state_directory_comes_from_the_environment_or_not_at_all() {
+        assert_eq!(state_dir(Some("/var/lib/monitor-agent")), Some("/var/lib/monitor-agent".into()));
+        assert_eq!(
+            state_dir(Some("  /var/lib/monitor-agent  ")),
+            Some("/var/lib/monitor-agent".into()),
+            "两侧空白要去掉 ✓"
+        );
+        // systemd 可能给多个（冒号分隔 ✓）⇒ 取第一个 ✓
+        assert_eq!(state_dir(Some("/var/lib/monitor-agent:/run/x")), Some("/var/lib/monitor-agent".into()));
+        assert_eq!(state_dir(Some("")), None, "空 ⇒ 拿不到 ✓");
+        assert_eq!(state_dir(Some("   ")), None);
+        assert_eq!(state_dir(None), None, "变量都没有 ⇒ 拿不到 ✓");
+        assert_eq!(state_dir(Some(":/run/x")), Some("/run/x".into()), "第一个是空的 ⇒ 用第二个 ✓");
+    }
+
+    /// 时间戳两个方向要**互为逆** ✓，而读不出来时**宁可 None 也不猜** ✓。
+    #[test]
+    fn the_probe_stamp_round_trips_and_refuses_nonsense() {
+        use std::time::{Duration, SystemTime};
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let s = format_stamp(t).unwrap();
+        assert_eq!(parse_stamp(&s), Some(t));
+        assert_eq!(parse_stamp(" 1700000000\n"), Some(t), "末尾换行要去掉 ✓");
+        // ⚠️ 读不出来 ⇒ None ✓（**不猜** ✗ —— 猜错方向可能就是"立刻又探一次" ✓✗）
+        assert_eq!(parse_stamp(""), None);
+        assert_eq!(parse_stamp("abc"), None);
+        assert_eq!(parse_stamp("-5"), None);
+        assert_eq!(parse_stamp("1.5"), None);
+        // 早于 Unix 纪元 ⇒ 写不出来 ✓（写 0 会被读成"1970 年探过" ✓✗）
+        assert_eq!(format_stamp(SystemTime::UNIX_EPOCH - Duration::from_secs(1)), None);
     }
 }
