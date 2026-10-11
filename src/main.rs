@@ -64,6 +64,13 @@ fn hello_payload(
         // 否则 hub 分不清"这台没允许检测"与"允许了但还没查到" ✓✗，
         // 而面板上那两件事长得完全不同 ✓（一个该显示"未允许检测" ✓，一个该显示"暂无数据" ✓）。
         o.insert("allow_ip_quality".into(), serde_json::json!(allow_ip_quality));
+        // ⭐ **能力**（不是许可 ✓）：这个二进制里有没有"会探流媒体"这段代码 ✓ ——
+        // 编译期就定了 ✓ ⇒ **不需要参数、不需要状态** ✓（与上面那个许可不同 ✓，
+        // 许可是"这台机器准不准" ✓，能力是"这个版本会不会" ✓ —— 两件事 ✓）。
+        // ⚠️ 它影响的是**面板措辞** ✓：让面板能说"版本不支持探测" ✓，
+        // 而不是让旧节点永远显示"还没测过" ✓✗（那是两种处境 ✓，处置也不同 ✓）。
+        // ⚠️ 名字与 hub 侧必须一致 ✓（hub 读的就是这个键 ✓）—— 两边各有一条测试钉住它 ✓✓。
+        o.insert("stream_probe".into(), serde_json::json!(true));
     }
     v
 }
@@ -1176,5 +1183,18 @@ mod tests {
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
         respawn_ping_tasks(&mut running, flood, &tx);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
+    }
+    /// ⭐ **能力旗子** ✓：hello 里必须带上"我会探流媒体" ✓ ——
+    /// 面板靠它把「**版本不支持探测**」与「**还没测过**」分开 ✓✓（那是两种处境 ✓）。
+    /// ⚠️ 键名与 hub 侧**必须逐字一致** ✓（hub 读的就是 `stream_probe` ✓）——
+    /// 这条测试就是钉住它的那一半 ✓✓（另一半在 hub 的测试里 ✓）。
+    #[test]
+    fn the_hello_says_this_version_can_probe_streaming() {
+        let v = hello_payload(serde_json::json!({}), false, false);
+        assert_eq!(v["stream_probe"], serde_json::json!(true), "键名与取值都要对 ✓");
+        // ⚠️ 它与那两个**许可**是独立的三件事 ✓：许可关着，能力照样在 ✓
+        //（"不准探"与"不会探"完全不同 ✓ —— 面板要分别说 ✓）
+        assert_eq!(v["allow_remote_upgrade"], serde_json::json!(false));
+        assert_eq!(v["allow_ip_quality"], serde_json::json!(false));
     }
 }
