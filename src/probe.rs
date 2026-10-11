@@ -257,6 +257,39 @@ impl State {
     }
 }
 
+// ─────────────────────────── 上报的报文（形状必须与 hub 的白名单逐字一致）───────────────────────────
+
+/// 把一次结论变成**要发给 hub 的报文** ✓✓ —— 纯函数 ✓（所以那几个字面量能被钉死 ✓）。
+///
+/// ⚠️⚠️ **这几个字符串必须与 hub 侧的白名单逐字一致** ✗✗：
+/// hub 只认 `unlocked` / `blocked` / `unknown` ✓（见 `agent_ws::sanitize_probe` ✓），
+/// 差一个字母 ⇒ 它会**整条丢掉** ✓ ⇒ 面板上就是**安静地什么都没有** ✓✗ ——
+/// 而那种失败没有任何报错 ✓，只能靠"两边各有一条测试钉住同一组字面量"来防 ✓✓。
+///
+/// ⚠️ **形状是"每服务一格"** ✓（`{"netflix": {...}}` ✓）：将来加服务只是多一个键 ✓，
+/// hub 与面板都不用改结构 ✓（这是"提前预留"真正落地的地方 ✓）。
+///
+/// ⚠️ `Unknown`（没读明白 ✓）**照样上报** ✓，不是"没结果就不报" ✗ ——
+/// "这次没读明白"本身是有用的信息 ✓（而 hub 那边缺字段与"报了 unknown"是两回事 ✓✓）。
+pub fn netflix_report(page_a: &str, page_b: &str) -> serde_json::Value {
+    let v = netflix_verdict(page_a, page_b);
+    let status = match v.status {
+        Status::Unlocked => "unlocked",
+        Status::Blocked => "blocked",
+        Status::Unknown => "unknown",
+    };
+    let mut item = serde_json::Map::new();
+    item.insert("status".into(), serde_json::json!(status));
+    if let Some(r) = v.region {
+        item.insert("region".into(), serde_json::json!(r));
+    }
+    serde_json::json!({ "netflix": serde_json::Value::Object(item) })
+}
+
+/// Netflix 那两个要取的自制剧页面 ✓（判据用的是它们 ✓ —— 见 [`netflix_verdict`] ✓）。
+pub const NETFLIX_PAGES: [&str; 2] =
+    ["https://www.netflix.com/title/81280792", "https://www.netflix.com/title/70143836"];
+
 // ─────────────────────────── 取页（本模块唯一不可单测的部分）───────────────────────────
 
 /// 一次 HTTPS GET ✓ —— **只是把页面拿回来** ✓：它失败就是失败 ✓，绝不猜 ✓。
@@ -614,5 +647,42 @@ mod tests {
         // 空 / 畸形输入不该 panic ✓（读不到 hostname 时 agent 用的是 "unknown" ✓）
         let _ = seed_from("");
         let _ = seed_from("unknown");
+    }
+    /// ⭐⭐ **钉死那几个字面量** ✓✓ —— 这是本模块最重要的一条测试 ✗：
+    /// hub 只认 `unlocked` / `blocked` / `unknown` ✓；改一个字母 ⇒ hub **整条丢掉** ✓
+    /// ⇒ 面板上安静地什么都没有 ✓✗，而且**没有任何报错** ✓。
+    /// ⇒ 所以这里把三个字面量**逐字**断言 ✓ —— 将来谁改这边、忘了改那边，这条会红 ✓✓。
+    #[test]
+    fn the_report_uses_exactly_the_words_the_hub_accepts() {
+        // 解锁 ✓（带地区 ✓）
+        assert_eq!(
+            netflix_report("<html>ok</html>{\"id\":\"JP\",\"countryName\":\"Japan\"}", "same"),
+            serde_json::json!({"netflix": {"status": "unlocked", "region": "JP"}})
+        );
+        // 未解锁 ✓（两个页面都说看不了 ✓）—— 没有地区 ✓（那边没有地区可言 ✓）
+        assert_eq!(netflix_report("Oh no!", "Oh no!"), serde_json::json!({"netflix": {"status": "blocked"}}));
+        // 没读明白 ✓ —— **照样上报** ✓（"这次没读明白"本身是有用的信息 ✓）
+        assert_eq!(netflix_report("", ""), serde_json::json!({"netflix": {"status": "unknown"}}));
+        // ⚠️ 逐字对照 ✓：把三个可能被写错的形式列出来，改错就红 ✓
+        for (i, want) in ["unlocked", "blocked", "unknown"].iter().enumerate() {
+            let got = match i {
+                0 => netflix_report("ok", "ok")["netflix"]["status"].clone(),
+                1 => netflix_report("Oh no!", "Oh no!")["netflix"]["status"].clone(),
+                _ => netflix_report("", "")["netflix"]["status"].clone(),
+            };
+            assert_eq!(got, serde_json::json!(want), "第 {i} 种必须是 {want:?} ✓");
+        }
+    }
+
+    /// 报文形状是"**每服务一格**" ✓ —— 将来加服务只多一个键 ✓，hub 与面板都不用改结构 ✓。
+    #[test]
+    fn the_report_is_one_key_per_service() {
+        let r = netflix_report("ok", "ok");
+        let obj = r.as_object().expect("报文必须是一个对象 ✓");
+        assert_eq!(obj.len(), 1, "第一期只有 netflix 一个键 ✓");
+        assert!(obj.contains_key("netflix"), "键名就是服务名 ✓（hub 的白名单按它认 ✓）");
+        // ⚠️ 地区**只在拿得到时**出现 ✓ —— 不给一个空的地区字段 ✓
+        //（空字符串会让 hub 的形状检查挡掉它 ✓，而"没有地区"与"地区是空"是两件事 ✓）
+        assert!(r["netflix"].get("region").is_none(), "拿不到地区就不给这个键 ✓");
     }
 }
