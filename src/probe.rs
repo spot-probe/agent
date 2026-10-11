@@ -1,10 +1,3 @@
-// ⚠️ **临时的死代码豁免，且写明何时删掉它** ✗ ——
-// 本模块是**分期落地**的第一期：判据先写好并测死 ✓，而"取页 + 上报"在下一笔才接上 ✓。
-// 在那之前它对编译器就是死代码 ✓ ⇒ 先 allow ✓。
-// ⭐ **接上取页与上报之后，请删掉下面这一行** ✓ —— 否则它会一直留着，
-//    把将来**真正的**死代码也一并藏掉 ✓✗（那种"豁免变成永久"的账最难查 ✓）。
-#![allow(dead_code)]
-
 //! 流媒体解锁探测 ✓（**只做判据** ✓ —— 发请求那半段在 [`fetch`] 里 ✓，本模块的核心是纯函数 ✓）。
 //!
 //! ⚠️ 这一块最容易产出**看起来像结论的错值** ✗✓，所以判据与取页**分开**：
@@ -286,6 +279,10 @@ pub fn netflix_report(page_a: &str, page_b: &str) -> serde_json::Value {
     serde_json::json!({ "netflix": serde_json::Value::Object(item) })
 }
 
+/// 一次响应最多读多少字节 ✓ —— **一处定义** ✓（`fetch` 与 `get_once` 都用它 ✓）。
+/// ⚠️ 写在两处会漂移 ✓：改了一处、另一处还是旧值 ✓，而那种不一致**不报错** ✓✗。
+const MAX_BYTES: usize = 512 * 1024;
+
 /// Netflix 那两个要取的自制剧页面 ✓（判据用的是它们 ✓ —— 见 [`netflix_verdict`] ✓）。
 pub const NETFLIX_PAGES: [&str; 2] =
     ["https://www.netflix.com/title/81280792", "https://www.netflix.com/title/70143836"];
@@ -306,7 +303,6 @@ pub const NETFLIX_PAGES: [&str; 2] =
 /// （hub 那边刚因为"整份读进内存"出过 OOM 事故 ✓，这条规矩一样适用 ✓）。
 pub async fn fetch(url: &str) -> anyhow::Result<String> {
     // 这些常量放在函数里，改动时只在一处 ✓。
-    const MAX_BYTES: usize = 512 * 1024;
     const MAX_REDIRECTS: u8 = 3;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -335,7 +331,6 @@ pub async fn fetch(url: &str) -> anyhow::Result<String> {
 async fn get_once(url: &str) -> anyhow::Result<(u16, usize, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    const MAX_BYTES: usize = 512 * 1024;
     let rest = url.strip_prefix("https://").ok_or_else(|| anyhow!("not https: {url}"))?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),

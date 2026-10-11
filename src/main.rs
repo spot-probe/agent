@@ -585,13 +585,37 @@ async fn session(
                     probe_started,
                     probe_seed,
                 ) {
-                    // ⚠️ 这一轮**还没有真正探测** ✗（探测与上报是下一步 ✓）——
-                    // ⇒ **绝不写"已探测"** ✗✗：那个时间戳正是"重启不风暴"的依据 ✓，
-                    // 在没有真探测时写它，就是往状态文件里写一句假话 ✓，
-                    // 而它下次会**挡住**本该发生的那次探测 ✓✗（比不写更糟 ✓）。
-                    // 所以这里只**说一声** ✓：装上去之后能在 journalctl 里看到
-                    // "排程确实按 6 小时 + 错开跑起来了" ✓✓（可见的证据，而不是"应该会跑" ✓）。
-                    eprintln!("probe: due now, but the probe itself is not wired yet; state untouched");
+                    // ⚠️ **必须 spawn，不能占着主循环** ✗✓：一次探测最长 15 秒 ✓，
+                    // 而主循环同时还在发心跳、回 ping ✓ ⇒ 阻塞它会让 hub 以为节点掉线 ✓✗。
+                    // ⚠️ spawn 出去**够不到 `ws`** ✗ ⇒ 走本仓现成的那条路 ✓：
+                    // 结果经 `result_tx` 回传 ✓，由主循环里既有的 `result_rx` 分支发出去 ✓
+                    //（ping 任务就是这么做的 ✓）⇒ **零新管线** ✓✓。
+                    let tx = result_tx.clone();
+                    let st = probe_state.clone();
+                    tokio::spawn(async move {
+                        // 两个页面**并行取** ✓（串行是白等一倍 ✓）。
+                        let (a, b) = tokio::join!(
+                            probe::fetch(probe::NETFLIX_PAGES[0]),
+                            probe::fetch(probe::NETFLIX_PAGES[1])
+                        );
+                        match (a, b) {
+                            (Ok(pa), Ok(pb)) => {
+                                let report = probe::netflix_report(&pa, &pb);
+                                if tx.send(notify("probe", report)).await.is_err() {
+                                    // 主循环已经结束（连接断了 ✓）⇒ 不用管 ✓
+                                }
+                            }
+                            // ⚠️⚠️ **取页失败 ⇒ 什么都不报** ✗✗ —— 一次网络故障
+                            // **不是**"这个区不解锁" ✓（那是这一块最容易犯的错 ✓）；
+                            // 不报 ⇒ 面板看到的是"上次的结论 + 它有多旧" ✓✓，那是实话 ✓。
+                            _ => eprintln!("probe: fetch failed; no verdict reported (a failure is not a verdict)"),
+                        }
+                        // ⚠️⚠️ **无论成败都要记下"刚探过"** ✓✓ ——
+                        // 失败也记的原因很硬 ✗：不记的话，下一跳（60 秒后 ✓）`due` 仍然是真 ✓
+                        // ⇒ **每 60 秒重试一次** ✓✗（网络一坏就是探测风暴 ✓，正是我们一直在防的东西 ✓）。
+                        // 记下之后，下一次要等满 6 小时 ✓ —— 代价只是"晚 6 小时再试" ✓，可以接受 ✓。
+                        st.remember(std::time::SystemTime::now());
+                    });
                 }
             }
             _ = tokio::time::sleep(remaining(last_frame)) => {
