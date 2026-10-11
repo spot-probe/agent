@@ -83,6 +83,57 @@ fn netflix_region(page: &str) -> Option<String> {
     }
 }
 
+// ───────────────────────────── 排程（纯函数，策略只在这里一处）─────────────────────────────
+
+/// 每隔多久探一次 ✓（用户定的：**6 小时** ✓）。
+pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// 这台节点的**固定错开量** ✓✓ —— 纯函数 ✓（同一台机器每次都算出同一个值 ✓）。
+///
+/// ⚠️ **为什么要错开** ✗：六台机器若都在同一秒去探 ✓，会在对方那边形成**规律的尖峰** ✓✗ ——
+/// 既是"看起来很像机器人"的流量特征 ✓，也让服务商更容易把我们挡掉 ✓。
+/// ⇒ 按节点自身的一个种子（hub 给的节点 id ✓）摊到整个周期上 ✓，各探各的时点 ✓。
+///
+/// ⚠️ 用**种子**而不是随机数 ✓：随机会让"同一台机器每次重启后换一个相位" ✓✗ ——
+/// 那不是错开 ✓，那是**每次都在不同时刻探一次** ✓（更糟 ✓）。固定相位才是"各探各的" ✓。
+pub fn offset(seed: u64) -> std::time::Duration {
+    // 乘一个大奇数再取模 ✓：节点 id 通常连号 ✓，直接用会得到连续的相位 ✓
+    //（六台机器摊在 6 小时里会挤成一小段 ✓）—— 乘散列把它铺开 ✓。
+    let spread = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    std::time::Duration::from_secs(spread % INTERVAL.as_secs())
+}
+
+/// **现在该不该探** ✓✓ —— 纯函数 ✓（所以"重启会不会引发探测风暴"这种问题能测出来 ✓）。
+///
+/// - 从没探过 ⇒ **探** ✓（新装的机器应当尽快有结论 ✓）；
+/// - 探过但还没到周期 ⇒ **不探** ✓✓ —— ⚠️ 这一条是关键 ✗：
+///   agent 崩溃重启循环时，"从没探过"若被当成"立刻探" ✓ ⇒ **探测风暴** ✓✗
+///   （hub 那次 OOM 崩溃循环就是这个形状 ✓ ⇒ 所以"上次探测时间"**必须落盘** ✓✓ —— 内存里的东西一重启就没了 ✓，而那正是风暴的来源 ✓）。
+///
+/// ⚠️ 相位（[`offset`]）只影响**首次**探测的时点 ✓：从没探过时，
+/// 要等到"开机时刻 + 相位"之后才探 ✓ —— 否则"等相位"这条对首探不生效 ✓，
+/// 六台新机器还是会在同一次纳管后一起探 ✓✗。
+pub fn due(
+    last_probe: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+    started: std::time::SystemTime,
+    seed: u64,
+) -> bool {
+    match last_probe {
+        // 探过 ✓：按上次探测时间算周期 ✓（不看开机时刻 ✓ —— 重启不该重置周期 ✓）
+        Some(last) => match now.duration_since(last) {
+            Ok(since) => since >= INTERVAL,
+            // 时钟往回调过（`last` 在未来 ✓）⇒ **不探** ✓：宁可少探一次，不可风暴 ✓。
+            Err(_) => false,
+        },
+        // 从没探过 ✓：等过了相位才探 ✓（把六台新机器摊开 ✓）
+        None => match now.duration_since(started) {
+            Ok(since) => since >= offset(seed),
+            Err(_) => true,
+        },
+    }
+}
+
 // ─────────────────────────── 取页（本模块唯一不可单测的部分）───────────────────────────
 
 /// 一次 HTTPS GET ✓ —— **只是把页面拿回来** ✓：它失败就是失败 ✓，绝不猜 ✓。
@@ -278,5 +329,52 @@ mod tests {
         assert_eq!(header("X-Location: https://c.example/\r\n", "location"), None);
         assert_eq!(header("Location:   \r\n", "location"), None, "空跳转目标不该被跟着走 ✓");
         assert_eq!(header("HTTP/1.1 200 OK\r\n\r\n", "location"), None);
+    }
+    /// ⭐ **重启不该引发探测风暴** ✓✓ —— 本轮最要紧的一条 ✓：
+    /// 探过一次之后，重启（`last_probe` 已落盘 ✓）必须**接着原来的周期**走 ✓，而不是立刻再探 ✓。
+    #[test]
+    fn a_restart_does_not_trigger_another_probe() {
+        use std::time::{Duration, SystemTime};
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let just_now = t0 + Duration::from_secs(60);
+        // 一分钟前刚探过 ✓，而周期是 6 小时 ⇒ **不探** ✓（哪怕进程是刚刚启动的 ✓）
+        assert!(!due(Some(just_now - Duration::from_secs(60)), just_now, just_now, 7));
+        // 六小时前探过 ⇒ 探 ✓
+        assert!(due(Some(just_now - INTERVAL), just_now, just_now, 7));
+        // 差一秒 ⇒ 还不探 ✓（边界不能含糊 ✓）
+        assert!(!due(Some(just_now - INTERVAL + Duration::from_secs(1)), just_now, just_now, 7));
+    }
+
+    /// 从没探过 ⇒ 探 ✓，但**要等过相位** ✓ —— 否则同时纳管的六台会在同一刻一起探 ✓✗。
+    #[test]
+    fn a_first_probe_waits_for_its_phase() {
+        use std::time::{Duration, SystemTime};
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        // 种子的相位是确定的 ✓（同一个种子每次都一样 ✓）
+        let ph = offset(7);
+        assert!(ph < INTERVAL, "相位必须落在周期之内 ✓");
+        // 刚启动 ⇒ 还不探 ✓（除非相位恰好是 0 ✓，那种子很少见 ✓ —— 用确定性的判据 ✓）
+        if ph > Duration::from_secs(1) {
+            assert!(!due(None, started + Duration::from_secs(1), started, 7), "还没到相位 ⇒ 不探 ✓");
+        }
+        assert!(due(None, started + ph, started, 7), "到了相位 ⇒ 探 ✓");
+    }
+
+    /// ⚠️ 时钟被往回调（上次探测时间在"未来" ✓）⇒ **不探** ✓ —— 宁可少探一次，不可风暴 ✓。
+    #[test]
+    fn a_clock_going_backwards_does_not_cause_a_probe() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert!(!due(Some(now + Duration::from_secs(3600)), now, now, 7));
+    }
+
+    /// 相位要**把不同节点摊开** ✓（连号的 id 也得散开 ✓）—— 否则"错开"只是个说法 ✓。
+    #[test]
+    fn nearby_seeds_do_not_land_next_to_each_other() {
+        let hours: Vec<u64> = (1..=8).map(|i| offset(i).as_secs() / 3600).collect();
+        let mut uniq = hours.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert!(uniq.len() >= 4, "8 个连号 seed 至少该散到 4 个不同的小时里（实际 {hours:?}）✓");
     }
 }
