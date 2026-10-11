@@ -41,15 +41,28 @@ struct Args {
     /// hub **无法**改写它（它不是设置项）：想开关只能在这台机器上重跑一次安装命令，
     /// 因为安装脚本会把它写进 systemd unit 的 ExecStart。
     allow_remote_upgrade: bool,
+    /// 是否**允许这台机器做 IP 质量检测** ✓（含把它的 IP 发给在线风险库 ✓），
+    /// 将来也是**流媒体检测**的门 ✓。默认关 ✓；与 allow_remote_upgrade 同一套做法 ✓：
+    /// 它不是设置项 ⇒ hub 改不了 ✓，只能在这台机器上重跑安装命令 ✓
+    ///（安装脚本把它写进 unit 的 ExecStart ✓）。
+    allow_ip_quality: bool,
 }
 
 /// hello 的载荷：机器的事实 + **这台机器是否允许被远程升级**。
 ///
 /// 后者不是"机器的属性"，所以不塞进 `Facts`；但它必须随 hello 一起上去 ——
 /// 否则面板上就分不出"可远程升级"和"仅手动升级"，而那正是三个月后最需要一眼看清的东西。
-fn hello_payload(mut v: serde_json::Value, allow_remote_upgrade: bool) -> serde_json::Value {
+fn hello_payload(
+    mut v: serde_json::Value,
+    allow_remote_upgrade: bool,
+    allow_ip_quality: bool,
+) -> serde_json::Value {
     if let Some(o) = v.as_object_mut() {
         o.insert("allow_remote_upgrade".into(), serde_json::json!(allow_remote_upgrade));
+        // 同上 ✓：它不是"机器的属性" ✓，但必须随 hello 上去 ✓ ——
+        // 否则 hub 分不清"这台没允许检测"与"允许了但还没查到" ✓✗，
+        // 而面板上那两件事长得完全不同 ✓（一个该显示"未允许检测" ✓，一个该显示"暂无数据" ✓）。
+        o.insert("allow_ip_quality".into(), serde_json::json!(allow_ip_quality));
     }
     v
 }
@@ -149,7 +162,7 @@ fn usage() -> ! {
            --insecure           Allow plain ws:// to a remote hub; the token\n                       \
                                 travels in the clear. Only for a hub reached\n                       \
                                 at ip:port with no TLS in front.\n  \
-           --allow-remote-upgrade\n                       \
+           --allow-remote-upgrade [--allow-ip-quality]\n                       \
                                 **Let the hub replace this agent's binary**\n                       \
                                 (over wss only, and only if it verifies\n                       \
                                 against the key compiled into the agent).\n                       \
@@ -162,8 +175,15 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Result<Args> {
-    let (mut server, mut token, mut interval, mut iface, mut insecure, mut allow_remote_upgrade) =
-        (None, None, 1u64, None, false, false);
+    let (
+        mut server,
+        mut token,
+        mut interval,
+        mut iface,
+        mut insecure,
+        mut allow_remote_upgrade,
+        mut allow_ip_quality,
+    ) = (None, None, 1u64, None, false, false, false);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -174,6 +194,9 @@ fn parse_args() -> Result<Args> {
             "--iface" => iface = Some(value()),
             "--insecure" => insecure = true,
             "--allow-remote-upgrade" => allow_remote_upgrade = true,
+            // ⚠️ **这个分支必须早于下面那个 `other => bail!`** ✓ ——
+            // 而它也正是"顺序坑"的解药 ✓：先把参数教给 agent ✓，再把带它的安装命令放出去 ✓。
+            "--allow-ip-quality" => allow_ip_quality = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
@@ -184,8 +207,18 @@ fn parse_args() -> Result<Args> {
     // 与其它三个一样给一个环境变量兜底：systemd unit 里两种写法都能用。
     let allow_remote_upgrade = allow_remote_upgrade
         || std::env::var("MONITOR_ALLOW_REMOTE_UPGRADE").is_ok_and(|v| v == "1" || v == "true");
+    let allow_ip_quality =
+        allow_ip_quality || std::env::var("MONITOR_ALLOW_IP_QUALITY").is_ok_and(|v| v == "1" || v == "true");
     let ifaces = collect::Ifaces::parse(&iface).map_err(anyhow::Error::msg)?;
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure, allow_remote_upgrade })
+    Ok(Args {
+        server,
+        token,
+        interval: interval.clamp(1, 3600),
+        ifaces,
+        insecure,
+        allow_remote_upgrade,
+        allow_ip_quality,
+    })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -378,6 +411,7 @@ async fn main() -> Result<()> {
             args.interval,
             &mut connected,
             args.allow_remote_upgrade,
+            args.allow_ip_quality,
         )
         .await
         {
@@ -453,6 +487,7 @@ async fn session(
     interval: u64,
     connected: &mut Option<Instant>,
     allow_remote_upgrade: bool,
+    allow_ip_quality: bool,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
@@ -498,7 +533,7 @@ async fn session(
 
     send(
         &mut ws,
-        notify("hello", hello_payload(serde_json::to_value(&facts)?, allow_remote_upgrade)),
+        notify("hello", hello_payload(serde_json::to_value(&facts)?, allow_remote_upgrade, allow_ip_quality)),
         remaining(last_frame),
     )
     .await?;
@@ -830,10 +865,23 @@ mod tests {
     /// 面板要能分出「可远程升级 / 仅手动升级」，靠的就是它在 hello 里如实上报。
     #[test]
     fn the_hello_carries_whether_remote_upgrade_is_allowed() {
-        let on = hello_payload(serde_json::json!({}), true);
-        let off = hello_payload(serde_json::json!({}), false);
+        let on = hello_payload(serde_json::json!({}), true, false);
+        let off = hello_payload(serde_json::json!({}), false, false);
         assert_eq!(on["allow_remote_upgrade"], serde_json::json!(true));
         assert_eq!(off["allow_remote_upgrade"], serde_json::json!(false));
+    }
+
+    /// 同上 ✓，钉住 **IP 质量检测的许可**也真的进了 hello ✓。
+    /// hub 靠它决定"要不要为这台节点查 ✓、要不要把它的 IP 发给在线风险库 ✓"，
+    /// 面板靠它分出「未允许检测」与「允许了但暂无数据」✓ —— 这两件事长得完全不同 ✓。
+    #[test]
+    fn the_hello_carries_whether_ip_quality_is_allowed() {
+        let on = hello_payload(serde_json::json!({}), false, true);
+        let off = hello_payload(serde_json::json!({}), false, false);
+        assert_eq!(on["allow_ip_quality"], serde_json::json!(true));
+        assert_eq!(off["allow_ip_quality"], serde_json::json!(false));
+        // 两个旗子互不影响 ✓（一个开着不该把另一个也点亮 ✓）
+        assert_eq!(on["allow_remote_upgrade"], serde_json::json!(false));
     }
 
     #[test]
