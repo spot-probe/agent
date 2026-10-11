@@ -83,6 +83,26 @@ fn netflix_region(page: &str) -> Option<String> {
     }
 }
 
+/// 抖动的**种子**来自一个稳定的、非密钥的标识 ✓ —— 纯函数 ✓（所以"稳不稳定"能测 ✓）。
+///
+/// ⚠️ 用什么、**绝不用什么** ✗✗：
+/// - 用 **hostname** ✓：稳定（同一台机器每次都一样 ✓，重启也不变 ✓）、不是秘密 ✓；
+/// - **绝不用 token** ✗✗ —— 哪怕只是"哈希一下" ✓：token 是凭据 ✓，
+///   把它引进一个日志/状态文件会碰到的地方，就是把凭据放进了一个它本不该去的路径 ✓✗。
+///
+/// 用稳定标识而不是随机数 ✓：随机会让"同一台机器每次重启换一个相位" ✓✗ ——
+/// 那不是错开 ✓，那是**每次都在不同时刻探一次** ✓（更糟 ✓）。
+pub fn seed_from(hostname: &str) -> u64 {
+    // FNV-1a ✓：几十行实现、无依赖、分布够用 ✓（这里只需要"不同机器落在不同相位" ✓，
+    // 不需要抗碰撞 ✓）。空 hostname 也有确定的值 ✓（会落到固定相位 ✓，不 panic ✓）。
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in hostname.trim().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 // ─────────────────────────── 状态：上次探测时间（落盘，或如实降级）───────────────────────────
 
 /// 状态目录从**环境**里认出来 ✓ —— 纯函数 ✓（所以"拿不到目录"这条路能测 ✓）。
@@ -575,5 +595,24 @@ mod tests {
             "末尾换行是合法的 ✓"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// 种子要**稳定** ✓（同一台机器每次一样 ✓）且**彼此散开** ✓（不同机器落在不同相位 ✓）。
+    /// ⚠️ 也断言它**不依赖任何秘密** ✓：同一个 hostname 永远同一个值 ✓ ——
+    /// 这条测试同时是"我们没把 token 掺进来"的一个提醒 ✓（掺了的话这里就得跟着改 ✓）。
+    #[test]
+    fn the_seed_is_stable_per_machine_and_spread_across_machines() {
+        assert_eq!(seed_from("node-a"), seed_from("node-a"), "同一台机器必须稳定 ✓");
+        assert_eq!(seed_from("  node-a  "), seed_from("node-a"), "两侧空白不该改变种子 ✓");
+        assert_ne!(seed_from("node-a"), seed_from("node-b"), "不同机器要不同 ✓");
+        // ⚠️ 相似的名字也要散开 ✓（`node-01` / `node-02` 相邻 ✓ ⇒ 相位不该挨着 ✓）
+        let hours: Vec<u64> =
+            (1..=8).map(|i| offset(seed_from(&format!("node-{i:02}"))).as_secs() / 3600).collect();
+        let mut uniq = hours.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert!(uniq.len() >= 4, "8 个相似名字至少该散到 4 个不同的小时里（实际 {hours:?}）✓");
+        // 空 / 畸形输入不该 panic ✓（读不到 hostname 时 agent 用的是 "unknown" ✓）
+        let _ = seed_from("");
+        let _ = seed_from("unknown");
     }
 }

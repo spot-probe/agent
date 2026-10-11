@@ -556,6 +556,19 @@ async fn session(
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // ⭐ 流媒体探测的排程 ✓（第一期第四步的接线 ✓）。
+    // ⚠️ **60 秒一跳**，而不是"睡 6 小时" ✗：后者会让"该探了"的判断粗糙到分钟级不可控 ✓，
+    // 系统休眠或时钟跳变之后更难说清 ✓。60 秒一跳的代价只是一次整数比较 ✓（`due` 是纯函数 ✓）。
+    // ⚠️ 时钟一律用 `SystemTime` ✓（与状态文件里的 Unix 秒同一种 ✓）——
+    // `Instant` 不能跨重启比较 ✓，而这个判断**必须**跨重启 ✓。
+    let probe_state = std::sync::Arc::new(probe::State::new(probe::state_dir(
+        std::env::var("STATE_DIRECTORY").ok().as_deref(),
+    )));
+    let probe_seed = probe::seed_from(&facts.hostname);
+    let probe_started = std::time::SystemTime::now();
+    let mut probe_tick = tokio::time::interval(Duration::from_secs(60));
+    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -565,6 +578,22 @@ async fn session(
             // Rebuilt each pass from the last frame, so silence costs exactly
             // HUB_SILENCE rather than a polling interval more. Kept separate
             // from the report tick, which --interval can stretch to an hour.
+            _ = probe_tick.tick() => {
+                if probe::due(
+                    probe_state.last(),
+                    std::time::SystemTime::now(),
+                    probe_started,
+                    probe_seed,
+                ) {
+                    // ⚠️ 这一轮**还没有真正探测** ✗（探测与上报是下一步 ✓）——
+                    // ⇒ **绝不写"已探测"** ✗✗：那个时间戳正是"重启不风暴"的依据 ✓，
+                    // 在没有真探测时写它，就是往状态文件里写一句假话 ✓，
+                    // 而它下次会**挡住**本该发生的那次探测 ✓✗（比不写更糟 ✓）。
+                    // 所以这里只**说一声** ✓：装上去之后能在 journalctl 里看到
+                    // "排程确实按 6 小时 + 错开跑起来了" ✓✓（可见的证据，而不是"应该会跑" ✓）。
+                    eprintln!("probe: due now, but the probe itself is not wired yet; state untouched");
+                }
+            }
             _ = tokio::time::sleep(remaining(last_frame)) => {
                 break Err(anyhow!("no frame from the hub in {}s", HUB_SILENCE.as_secs()));
             }
