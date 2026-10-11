@@ -600,22 +600,18 @@ async fn session(
                     let tx = result_tx.clone();
                     let st = probe_state.clone();
                     tokio::spawn(async move {
-                        // 两个页面**并行取** ✓（串行是白等一倍 ✓）。
-                        let (a, b) = tokio::join!(
-                            probe::fetch(probe::NETFLIX_PAGES[0]),
-                            probe::fetch(probe::NETFLIX_PAGES[1])
-                        );
-                        match (a, b) {
-                            (Ok(pa), Ok(pb)) => {
-                                let report = probe::netflix_report(&pa, &pb);
+                        // 探哪些服务、以及"每个服务各自独立地报或沉默" ✓ 都在 `probe::run` 里 ✓
+                        //（那样这里只剩"拿到就发" ✓ —— 主循环里不该有业务判断 ✓）。
+                        match probe::run().await {
+                            Some(report) => {
                                 if tx.send(notify("probe", report)).await.is_err() {
                                     // 主循环已经结束（连接断了 ✓）⇒ 不用管 ✓
                                 }
                             }
-                            // ⚠️⚠️ **取页失败 ⇒ 什么都不报** ✗✗ —— 一次网络故障
-                            // **不是**"这个区不解锁" ✓（那是这一块最容易犯的错 ✓）；
-                            // 不报 ⇒ 面板看到的是"上次的结论 + 它有多旧" ✓✓，那是实话 ✓。
-                            _ => eprintln!("probe: fetch failed; no verdict reported (a failure is not a verdict)"),
+                            // ⚠️⚠️ **全都取不到 ⇒ 什么都不报** ✗✗ —— 一次网络故障**不是**结论 ✓
+                            //（那是这一块最容易犯的错 ✓）；不报 ⇒ 面板看到的是
+                            // "上次的结论 + 它有多旧" ✓✓，那是实话 ✓。
+                            None => eprintln!("probe: nothing could be fetched; no verdict reported (a failure is not a verdict)"),
                         }
                         // ⚠️⚠️ **无论成败都要记下"刚探过"** ✓✓ ——
                         // 失败也记的原因很硬 ✗：不记的话，下一跳（60 秒后 ✓）`due` 仍然是真 ✓

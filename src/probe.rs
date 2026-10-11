@@ -22,6 +22,10 @@ pub enum Status {
     /// 请求拿到了页面 ✓，但**内容看不懂** ✓（对方改版 / 返回了别的东西 ✓）
     /// ⚠️ 与 `Blocked` 分开 ✓：它**不是**"被墙"的结论 ✓，只是"这次没读明白" ✓。
     Unknown,
+    /// **解锁、但对方把这个地址识别成机房** ✓✓（用户定的第四档 ✓）。
+    /// ⚠️ 它与 `Unlocked` **不是一回事** ✗：机房 IP 在很多服务上吃亏 ✓，
+    /// 而这正是运维想知道的 ✓；也与 `Blocked` 不同 ✓ ⇒ 独立一档 ✓。
+    Idc,
 }
 
 /// 一个服务的完整结论 ✓（与参考实现的三格一致 ✓：状态 ✓ 地区 ✓ —— 方式那格第一版不做 ✓）。
@@ -252,40 +256,144 @@ impl State {
 
 // ─────────────────────────── 上报的报文（形状必须与 hub 的白名单逐字一致）───────────────────────────
 
-/// 把一次结论变成**要发给 hub 的报文** ✓✓ —— 纯函数 ✓（所以那几个字面量能被钉死 ✓）。
+/// 把一次结论变成**要发给 hub 的报文** ✓✓ —— 纯函数 ✓，而且**通用** ✓：
+/// 服务名是参数 ✓ ⇒ 加一个服务**不必再抄一份** ✗（抄一份就会有两处要同步 ✓，迟早漏一处 ✓）。
 ///
-/// ⚠️⚠️ **这几个字符串必须与 hub 侧的白名单逐字一致** ✗✗：
-/// hub 只认 `unlocked` / `blocked` / `unknown` ✓（见 `agent_ws::sanitize_probe` ✓），
-/// 差一个字母 ⇒ 它会**整条丢掉** ✓ ⇒ 面板上就是**安静地什么都没有** ✓✗ ——
-/// 而那种失败没有任何报错 ✓，只能靠"两边各有一条测试钉住同一组字面量"来防 ✓✓。
-///
-/// ⚠️ **形状是"每服务一格"** ✓（`{"netflix": {...}}` ✓）：将来加服务只是多一个键 ✓，
-/// hub 与面板都不用改结构 ✓（这是"提前预留"真正落地的地方 ✓）。
-///
-/// ⚠️ `Unknown`（没读明白 ✓）**照样上报** ✓，不是"没结果就不报" ✗ ——
-/// "这次没读明白"本身是有用的信息 ✓（而 hub 那边缺字段与"报了 unknown"是两回事 ✓✓）。
-pub fn netflix_report(page_a: &str, page_b: &str) -> serde_json::Value {
-    let v = netflix_verdict(page_a, page_b);
+/// ⚠️⚠️ **状态字符串必须与 hub 侧的白名单逐字一致** ✗✗（见 `agent_ws::sanitize_probe` ✓）：
+/// `unlocked` ✓ / `blocked` ✓ / `unknown` ✓ / **`idc`** ✓（第四档 ✓）——
+/// 差一个字母 ⇒ hub 把整条丢掉 ✓ ⇒ 面板上**安静地什么都没有** ✓✗（没有任何报错 ✓）。
+pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
     let status = match v.status {
         Status::Unlocked => "unlocked",
         Status::Blocked => "blocked",
         Status::Unknown => "unknown",
+        Status::Idc => "idc",
     };
     let mut item = serde_json::Map::new();
     item.insert("status".into(), serde_json::json!(status));
-    if let Some(r) = v.region {
+    if let Some(r) = &v.region {
         item.insert("region".into(), serde_json::json!(r));
     }
-    serde_json::json!({ "netflix": serde_json::Value::Object(item) })
+    serde_json::json!({ service: serde_json::Value::Object(item) })
 }
 
+/// 把一次结论变成**要发给 hub 的报文** ✓✓ —— 纯函数 ✓（所以那几个字面量能被钉死 ✓）。
 /// 一次响应最多读多少字节 ✓ —— **一处定义** ✓（`fetch` 与 `get_once` 都用它 ✓）。
 /// ⚠️ 写在两处会漂移 ✓：改了一处、另一处还是旧值 ✓，而那种不一致**不报错** ✓✗。
 const MAX_BYTES: usize = 512 * 1024;
 
-/// Netflix 那两个要取的自制剧页面 ✓（判据用的是它们 ✓ —— 见 [`netflix_verdict`] ✓）。
+// ─────────────────────────────── TikTok（三档 + 机器人拦截）───────────────────────────────
+
+/// TikTok 要取的两个地址 ✓（照参考实现 ✓）：主站 ✓ 与"被拦截时换的那个" ✓。
+pub const TIKTOK_MAIN: &str = "https://www.tiktok.com/";
+pub const TIKTOK_FALLBACK: &str = "https://www.tiktok.com/explore";
+
+/// 这一页是不是**机器人拦截页** ✓✓ —— 参考实现判据的原话是 `Please wait...` ✓。
+///
+/// ⚠️ 它**不是**"未解锁" ✗✗：拦截页说明**我们没读到内容** ✓ ⇒ 那一路要重试或如实说"没读到" ✓。
+/// 把拦截当成"被墙"是这一块最容易犯的错 ✓（而且它的结论**看起来很合理** ✓✗）。
+pub fn is_bot_check(page: &str) -> bool {
+    page.contains("Please wait...")
+}
+
+/// 从页面里取地区 ✓（`"region":"XX"` ✓）。
+/// ⚠️ 形状检查照 Netflix 那条的规矩 ✓：**必须两位大写字母** ✓ ——
+/// 否则页面上任何 `"region":"…"` 都会被当地区 ✓✗（例如语言码 ✓、别的字段 ✓）。
+pub fn tiktok_region(page: &str) -> Option<String> {
+    let i = page.find("\"region\":\"")? + 10;
+    let rest = &page[i..];
+    let end = rest.find('"')?;
+    let code = &rest[..end];
+    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+        Some(code.to_string())
+    } else {
+        None
+    }
+}
+
+/// TikTok 的判据 ✓✓ —— 纯函数 ✓，输入是**两次请求**的结果 ✓（主站 ✓ 与"带长 Accept 的那次" ✓）。
+///
+/// 参考实现的三档 ✓（逐行读出来的 ✓）：
+/// - **主站给了地区** ⇒ **解锁** ✓（地区就是它 ✓）；
+/// - 主站**没给**地区、而**第二次**给了 ⇒ **机房** ✓✓（`Idc` ✓ —— "能解，但被识别成机房" ✓）；
+/// - 两次都没有 ⇒ **未解锁** ✓。
+///
+/// ⚠️ 而**拦截页**另走一路 ✗：它说明"没读到" ✓ ⇒ `Unknown` ✓，**不是**"未解锁" ✓✗
+///（重试与否交给调用方 ✓ —— 那半段要发请求，不可单测 ✓）。
+pub fn tiktok_verdict(main: &str, second: &str) -> Verdict {
+    if let Some(r) = tiktok_region(main) {
+        return Verdict { status: Status::Unlocked, region: Some(r) };
+    }
+    if is_bot_check(main) {
+        return Verdict { status: Status::Unknown, region: None };
+    }
+    if let Some(r) = tiktok_region(second) {
+        return Verdict { status: Status::Idc, region: Some(r) };
+    }
+    Verdict { status: Status::Blocked, region: None }
+}
+
+/// TikTok 那两个要取的自制剧页面 ✓（判据用的是它们 ✓ —— 见 [`netflix_verdict`] ✓）。
 pub const NETFLIX_PAGES: [&str; 2] =
     ["https://www.netflix.com/title/81280792", "https://www.netflix.com/title/70143836"];
+
+// ─────────────────────────── 探一轮（所有服务；一个失败不影响其它）───────────────────────────
+
+/// 第二次请求用的 Accept ✓（照参考实现 ✓ —— 它就是"机房"那一档的分水岭 ✓）。
+/// ⚠️ 参考里那行被截断了 ✓，我只看到 `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif…` ✓
+/// ⇒ 这里用一个**浏览器样**的 Accept ✓（这是**未完全核实**的一处 ✗ —— 记在这里 ✓，
+///   若 TikTok 那一档老是不出现 ✓，第一个该看的就是这个常量 ✓）。
+pub const TIKTOK_BROWSER_ACCEPT: &str =
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+
+/// 探**所有**服务 ✓ 并合并成一份报文 ✓。
+///
+/// ⚠️ **一个服务失败不影响其它** ✓✓（各自独立地报或沉默 ✓）——
+/// 用"任一失败就整体不报"会让一次网络抖动抹掉别的服务的结论 ✓✗。
+/// ⚠️ 而**全都失败 ⇒ `None`** ✓（**不报空报文** ✗：那会让面板看起来"探测过了、什么都没有" ✓✗）。
+pub async fn run() -> Option<serde_json::Value> {
+    let mut out = serde_json::Map::new();
+
+    // Netflix ✓：两页**并行**取 ✓（串行是白等一倍 ✓）；任一失败 ⇒ 这个服务这次不报 ✓。
+    let (a, b) = tokio::join!(fetch(NETFLIX_PAGES[0]), fetch(NETFLIX_PAGES[1]));
+    if let (Ok(pa), Ok(pb)) = (a, b) {
+        merge(&mut out, verdict_json("netflix", &netflix_verdict(&pa, &pb)));
+    }
+
+    // TikTok ✓：主站 ⇒ 被拦截就换 fallback 再取一次 ✓ ⇒ 需要时才发第二次（带浏览器 Accept ✓）。
+    if let Ok(main) = fetch(TIKTOK_MAIN).await {
+        let main = if is_bot_check(&main) {
+            // 换一个地址再试一次 ✓；**再失败就用原来那份** ✓（它仍是拦截页 ⇒ 判据给 `Unknown` ✓✓，
+            // 也就是"没读到" ✓ —— 正是实话 ✓）。
+            fetch(TIKTOK_FALLBACK).await.unwrap_or(main)
+        } else {
+            main
+        };
+        // ⚠️ 第二次**只在主站没给出地区时才发** ✗✓ —— 主站给了地区就已经是结论了 ✓
+        //（解锁 ✓）⇒ 省掉一次对外请求 ✓✓（每个请求都是可被观察的流量 ✓）。
+        let second = if tiktok_region(&main).is_none() && !is_bot_check(&main) {
+            fetch_with(TIKTOK_MAIN, TIKTOK_BROWSER_ACCEPT).await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+        merge(&mut out, verdict_json("tiktok", &tiktok_verdict(&main, &second)));
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(out))
+    }
+}
+
+/// 把一份单服务的报文并进总报文 ✓（形状是"每服务一格" ✓）。
+fn merge(into: &mut serde_json::Map<String, serde_json::Value>, one: serde_json::Value) {
+    if let Some(o) = one.as_object() {
+        for (k, v) in o {
+            into.insert(k.clone(), v.clone());
+        }
+    }
+}
 
 // ─────────────────────────── 取页（本模块唯一不可单测的部分）───────────────────────────
 
@@ -302,13 +410,20 @@ pub const NETFLIX_PAGES: [&str; 2] =
 /// ⚠️ **有上限** ✓：只读 `MAX_BYTES` 就停 ✓ —— 一个恶意/异常的响应不该把这台机器的内存吃掉 ✓
 /// （hub 那边刚因为"整份读进内存"出过 OOM 事故 ✓，这条规矩一样适用 ✓）。
 pub async fn fetch(url: &str) -> anyhow::Result<String> {
+    fetch_with(url, "").await
+}
+
+/// 同 [`fetch`] ✓，但可以多带**一个请求头** ✓ —— TikTok 的第二次请求要用它区分"机房" ✓
+///（参考实现就是靠换这段 Accept 头拿到不同结果的 ✓）。
+pub async fn fetch_with(url: &str, extra_header: &str) -> anyhow::Result<String> {
     // 这些常量放在函数里，改动时只在一处 ✓。
     const MAX_REDIRECTS: u8 = 3;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
-        let (status, headers_end, body) = tokio::time::timeout(TIMEOUT, get_once(&current)).await??;
+        let (status, headers_end, body) =
+            tokio::time::timeout(TIMEOUT, get_once(&current, extra_header)).await??;
         if (300..400).contains(&status) {
             // Location 头是跳转目标 ✓；没有就没什么可跟的 ✓。
             match header(&body[..headers_end.min(body.len())], "location") {
@@ -328,7 +443,7 @@ pub async fn fetch(url: &str) -> anyhow::Result<String> {
 
 /// 发一次请求并读回（**最多** `MAX_BYTES` ✓）。返回 `(状态码, 头部结束位置, 全文)`。
 /// ⚠️ 与 `fetch` 拆开只是为了让上面那段跳转逻辑**读起来是一件事** ✓。
-async fn get_once(url: &str) -> anyhow::Result<(u16, usize, String)> {
+async fn get_once(url: &str, extra_header: &str) -> anyhow::Result<(u16, usize, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let rest = url.strip_prefix("https://").ok_or_else(|| anyhow!("not https: {url}"))?;
@@ -349,8 +464,12 @@ async fn get_once(url: &str) -> anyhow::Result<(u16, usize, String)> {
 
     let tcp = TcpStream::connect((host, port)).await?;
     let mut tls = connector.connect(name, tcp).await?;
+    // ⚠️ 自定义头**只在给了的时候**才加 ✓ —— 空字符串不加，免得写出一个空头行 ✓✗
+    //（空头行会被某些服务器当成请求结束 ✓，那会让"取页成功但没有内容" ✓✗ —— 安静的错 ✓）。
+    let extra =
+        if extra_header.trim().is_empty() { String::new() } else { format!("{}\r\n", extra_header.trim()) };
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: monitor-agent\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: monitor-agent\r\nAccept: */*\r\n{extra}Connection: close\r\n\r\n"
     );
     tls.write_all(req.as_bytes()).await?;
 
@@ -397,6 +516,14 @@ fn header(head: &str, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// 测试里的小助手 ✓：走**生产同一条路**（`verdict_json` + `netflix_verdict`）✓ ——
+    /// ⚠️ 从前这里是一个 `netflix_report` 包装 ✓，而生产路径改走通用那条之后 ✓
+    /// 它就只剩测试在用了 ✓✗ ⇒ 那个包装已删除 ✓：留着会让"测试测的路"与"线上跑的路"
+    /// **不是同一条** ✓（很隐蔽的一种脱节 ✓）。
+    fn nf(a: &str, b: &str) -> serde_json::Value {
+        verdict_json("netflix", &netflix_verdict(a, b))
+    }
+
     use super::*;
 
     /// 两个页面都说看不了 ⇒ **未解锁** ✓（这是"对方明确告诉你"的那种 ✓，是结论 ✓）。
@@ -651,19 +778,19 @@ mod tests {
     fn the_report_uses_exactly_the_words_the_hub_accepts() {
         // 解锁 ✓（带地区 ✓）
         assert_eq!(
-            netflix_report("<html>ok</html>{\"id\":\"JP\",\"countryName\":\"Japan\"}", "same"),
+            nf("<html>ok</html>{\"id\":\"JP\",\"countryName\":\"Japan\"}", "same"),
             serde_json::json!({"netflix": {"status": "unlocked", "region": "JP"}})
         );
         // 未解锁 ✓（两个页面都说看不了 ✓）—— 没有地区 ✓（那边没有地区可言 ✓）
-        assert_eq!(netflix_report("Oh no!", "Oh no!"), serde_json::json!({"netflix": {"status": "blocked"}}));
+        assert_eq!(nf("Oh no!", "Oh no!"), serde_json::json!({"netflix": {"status": "blocked"}}));
         // 没读明白 ✓ —— **照样上报** ✓（"这次没读明白"本身是有用的信息 ✓）
-        assert_eq!(netflix_report("", ""), serde_json::json!({"netflix": {"status": "unknown"}}));
+        assert_eq!(nf("", ""), serde_json::json!({"netflix": {"status": "unknown"}}));
         // ⚠️ 逐字对照 ✓：把三个可能被写错的形式列出来，改错就红 ✓
         for (i, want) in ["unlocked", "blocked", "unknown"].iter().enumerate() {
             let got = match i {
-                0 => netflix_report("ok", "ok")["netflix"]["status"].clone(),
-                1 => netflix_report("Oh no!", "Oh no!")["netflix"]["status"].clone(),
-                _ => netflix_report("", "")["netflix"]["status"].clone(),
+                0 => nf("ok", "ok")["netflix"]["status"].clone(),
+                1 => nf("Oh no!", "Oh no!")["netflix"]["status"].clone(),
+                _ => nf("", "")["netflix"]["status"].clone(),
             };
             assert_eq!(got, serde_json::json!(want), "第 {i} 种必须是 {want:?} ✓");
         }
@@ -672,12 +799,71 @@ mod tests {
     /// 报文形状是"**每服务一格**" ✓ —— 将来加服务只多一个键 ✓，hub 与面板都不用改结构 ✓。
     #[test]
     fn the_report_is_one_key_per_service() {
-        let r = netflix_report("ok", "ok");
+        let r = nf("ok", "ok");
         let obj = r.as_object().expect("报文必须是一个对象 ✓");
         assert_eq!(obj.len(), 1, "第一期只有 netflix 一个键 ✓");
         assert!(obj.contains_key("netflix"), "键名就是服务名 ✓（hub 的白名单按它认 ✓）");
         // ⚠️ 地区**只在拿得到时**出现 ✓ —— 不给一个空的地区字段 ✓
         //（空字符串会让 hub 的形状检查挡掉它 ✓，而"没有地区"与"地区是空"是两件事 ✓）
         assert!(r["netflix"].get("region").is_none(), "拿不到地区就不给这个键 ✓");
+    }
+    /// ⭐ TikTok 那**三档** ✓✓ —— 第二档（机房 ✓）是最容易漏掉的 ✗：
+    /// 参考实现里它是"主站没给、**第二次**给了" ✓ —— 漏掉它就会把机房机器显示成普通解锁 ✓✗。
+    #[test]
+    fn tiktok_verdict_keeps_the_three_tiers_apart() {
+        let main = "{\"region\":\"JP\"}";
+        let second = "{\"region\":\"US\"}";
+        // ① 主站给了 ⇒ **解锁** ✓（地区取主站那个 ✓）
+        assert_eq!(
+            tiktok_verdict(main, second),
+            Verdict { status: Status::Unlocked, region: Some("JP".into()) }
+        );
+        // ② 主站没给、第二次给了 ⇒ **机房** ✓✓（不是"解锁" ✗，也不是"未解锁" ✗）
+        assert_eq!(
+            tiktok_verdict("<html>nothing</html>", second),
+            Verdict { status: Status::Idc, region: Some("US".into()) }
+        );
+        // ③ 两次都没有 ⇒ **未解锁** ✓
+        assert_eq!(
+            tiktok_verdict("<html>nope</html>", "<html>nope</html>"),
+            Verdict { status: Status::Blocked, region: None }
+        );
+    }
+
+    /// ⚠️⚠️ **拦截页不是"未解锁"** ✗✗ —— 这一块最容易犯的错 ✓，
+    /// 而且它的错值**看起来很合理** ✓（"这个区看不了" ✓）⇒ 用户会据此换机器 ✓，而问题在网络/风控上 ✓。
+    #[test]
+    fn a_bot_check_page_means_we_did_not_read_it() {
+        let blocked_page = "<html>Please wait...</html>";
+        assert!(is_bot_check(blocked_page));
+        assert_eq!(
+            tiktok_verdict(blocked_page, "<html>nothing</html>"),
+            Verdict { status: Status::Unknown, region: None },
+            "拦截 ⇒ 没读到 ✓，**不是**未解锁 ✗"
+        );
+        // 而"真的没有地区、也没有拦截标记" ⇒ 那才是未解锁 ✓
+        assert_eq!(tiktok_verdict("<html>x</html>", "<html>y</html>").status, Status::Blocked);
+    }
+
+    /// 地区必须**两位大写字母** ✓（与 Netflix 那条同一条规矩 ✓）——
+    /// 否则语言码 / 别的字段都会被当地区 ✓✗，而那种错**看起来完全正常** ✓。
+    #[test]
+    fn tiktok_regions_must_look_like_regions() {
+        assert_eq!(tiktok_region("{\"region\":\"JP\"}").as_deref(), Some("JP"));
+        assert_eq!(tiktok_region("{\"region\":\"jp\"}"), None, "小写不算 ✓");
+        assert_eq!(tiktok_region("{\"region\":\"JPN\"}"), None, "三位不算 ✓");
+        assert_eq!(tiktok_region("{\"region\":\"\"}"), None, "空不算 ✓");
+        assert_eq!(tiktok_region("<html>nothing</html>"), None, "没有就别说 ✓");
+    }
+
+    /// 机房的报文里状态字必须是 **`idc`** ✓✓ —— 它要与 hub 的白名单**逐字一致** ✓
+    /// （否则 hub 整条丢掉 ✓ ⇒ 面板安静地什么都没有 ✓✗）。
+    #[test]
+    fn the_idc_status_word_is_the_one_the_hub_accepts() {
+        let v = tiktok_verdict("<html>x</html>", "{\"region\":\"US\"}");
+        assert_eq!(
+            verdict_json("tiktok", &v),
+            serde_json::json!({"tiktok": {"status": "idc", "region": "US"}})
+        );
     }
 }
