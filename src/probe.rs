@@ -238,4 +238,45 @@ mod tests {
         assert_eq!(netflix_verdict("", "").status, Status::Unknown);
         assert_eq!(netflix_verdict("   \n", "  ").status, Status::Unknown);
     }
+    /// ⭐ **跳转那一段的第一道闸** ✓✓：状态码与"头部在哪里结束"必须读对 ✓ ——
+    /// 读错就会把**正文**当成头部去找 `location:` ✓✗，而那会得出一个安静的错跳转 ✓。
+    #[test]
+    fn the_status_line_and_the_header_boundary_are_read_correctly() {
+        let r = "HTTP/1.1 302 Found\r\nLocation: https://www.netflix.com/browse\r\n\r\nBODY";
+        let (status, end) = parse_status_and_headers(r).unwrap();
+        assert_eq!(status, 302);
+        assert_eq!(&r[end..], "BODY", "头部结束位置要正好在空行之后 ✓");
+        assert_eq!(parse_status_and_headers("HTTP/1.1 200 OK\r\n\r\n").unwrap().0, 200);
+        // ⚠️ **被截断的响应**（没有空行 ✓）⇒ 当作"全文都是头" ✓，而不是报错 ✓ ——
+        // 截断是真会发生的事（我们的 512 KB 上限 ✓），它不该被当成"这个服务没数据" ✗。
+        let cut = "HTTP/1.1 200 OK\r\nContent-Type: text/htm";
+        let (s2, e2) = parse_status_and_headers(cut).unwrap();
+        assert_eq!((s2, e2), (200, cut.len()));
+        assert!(parse_status_and_headers("garbage").is_err(), "真读不懂才报错 ✓");
+    }
+
+    /// ⭐ **"只从头部找 location"** ✓✓ —— 本轮最要紧的一条 ✓：
+    /// 正文里恰好出现 `location:` **绝不能**被当成跳转 ✓✗。
+    /// ⚠️ 这里测的是**契约** ✓：`header` 只在传进来的那段里找 ✓ ——
+    /// 而"只把头部传进来"这个动作在 `fetch` 里 ✓（那半段不可单测 ✓）
+    /// ⇒ 所以把契约写成测试 ✓，免得将来有人拿**全文**去调它 ✓✗。
+    #[test]
+    fn a_location_like_string_in_the_body_is_not_a_redirect() {
+        let head = "HTTP/1.1 302 Found\r\nLocation: https://www.netflix.com/browse\r\n\r\n";
+        assert_eq!(header(head, "location").as_deref(), Some("https://www.netflix.com/browse"));
+        assert_eq!(
+            header("LOCATION: https://a.example/\r\n", "location").as_deref(),
+            Some("https://a.example/"),
+            "大小写不敏感 ✓"
+        );
+        assert_eq!(
+            header("location:   https://b.example/  \r\n", "location").as_deref(),
+            Some("https://b.example/"),
+            "两侧空白要去掉 ✓"
+        );
+        // ⚠️ **`X-Location:` 不是 `Location:`** ✓ —— 前缀匹配不能把带前缀的头也算上 ✓✗
+        assert_eq!(header("X-Location: https://c.example/\r\n", "location"), None);
+        assert_eq!(header("Location:   \r\n", "location"), None, "空跳转目标不该被跟着走 ✓");
+        assert_eq!(header("HTTP/1.1 200 OK\r\n\r\n", "location"), None);
+    }
 }
