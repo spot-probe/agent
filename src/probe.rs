@@ -14,6 +14,9 @@
 //! 判据来源 ✓：照 xykt 的 IPQuality（`ip.sh`）里 `MediaUnlockTest_Netflix` 的**实际做法** ✓，
 //! 不是照 blog 猜的 ✓ —— 见下面每一条的注释 ✓。
 
+use anyhow::anyhow;
+use tokio::net::TcpStream;
+
 /// 一个服务的探测结论 ✓ —— ⚠️ **四态** ✓✓，而"失败"与"未解锁"**必须分开** ✗✗：
 /// 网络不通 ✓、被墙 ✓、对方改版 ✓ 都会让请求失败 ✓，而那些**都不是**"这个区不解锁" ✓。
 /// 把失败说成未解锁 = 假信息 ✓（用户会据此换机器，而问题其实在网络上 ✓）。
@@ -78,6 +81,116 @@ fn netflix_region(page: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+// ─────────────────────────── 取页（本模块唯一不可单测的部分）───────────────────────────
+
+/// 一次 HTTPS GET ✓ —— **只是把页面拿回来** ✓：它失败就是失败 ✓，绝不猜 ✓。
+///
+/// ⚠️ 这里**没有任何判断** ✓（判断全在纯函数里 ✓✓）—— 这是刻意的：
+/// 网络的失败方式太多（连不上 ✓ 超时 ✓ 证书错 ✓ 被劫持 ✓），
+/// 把"判断"混进来就会出现"某次网络抖动 ⇒ 结论变了" ✓✗。
+///
+/// ⚠️ **跟随跳转** ✓✓：参考实现用的是 `curl -fsL` ✓，而 `netflix.com/title/...`
+/// 会按地区 302 ✓ ⇒ 不跟的话读到的是跳转页 ✓，而它的内容**看起来也像正常页面** ✓✗
+/// （于是判据会得出一个安静的错结论 ✓）。只跟 `MAX_REDIRECTS` 次 ✓。
+///
+/// ⚠️ **有上限** ✓：只读 `MAX_BYTES` 就停 ✓ —— 一个恶意/异常的响应不该把这台机器的内存吃掉 ✓
+/// （hub 那边刚因为"整份读进内存"出过 OOM 事故 ✓，这条规矩一样适用 ✓）。
+pub async fn fetch(url: &str) -> anyhow::Result<String> {
+    // 这些常量放在函数里，改动时只在一处 ✓。
+    const MAX_BYTES: usize = 512 * 1024;
+    const MAX_REDIRECTS: u8 = 3;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let (status, headers_end, body) = tokio::time::timeout(TIMEOUT, get_once(&current)).await??;
+        if (300..400).contains(&status) {
+            // Location 头是跳转目标 ✓；没有就没什么可跟的 ✓。
+            match header(&body[..headers_end.min(body.len())], "location") {
+                Some(loc) if loc.starts_with("https://") => current = loc,
+                Some(_) => anyhow::bail!("refusing a non-https redirect from {current}"),
+                None => return Ok(body),
+            }
+            continue;
+        }
+        if status != 200 {
+            anyhow::bail!("{current} answered HTTP {status}");
+        }
+        return Ok(body);
+    }
+    anyhow::bail!("too many redirects starting at {url}")
+}
+
+/// 发一次请求并读回（**最多** `MAX_BYTES` ✓）。返回 `(状态码, 头部结束位置, 全文)`。
+/// ⚠️ 与 `fetch` 拆开只是为了让上面那段跳转逻辑**读起来是一件事** ✓。
+async fn get_once(url: &str) -> anyhow::Result<(u16, usize, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const MAX_BYTES: usize = 512 * 1024;
+    let rest = url.strip_prefix("https://").ok_or_else(|| anyhow!("not https: {url}"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let host = authority.split(':').next().unwrap_or(authority);
+    let port = authority.split_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(443);
+
+    // 根证书来自 webpki-roots ✓（与 ws 那条路同一套信任根 ✓）——
+    // ⚠️ 这很重要 ✓：**没有**它就只能不校验证书 ✓，那等于把"被劫持"当正常 ✓✗。
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())?;
+
+    let tcp = TcpStream::connect((host, port)).await?;
+    let mut tls = connector.connect(name, tcp).await?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: monitor-agent\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+    tls.write_all(req.as_bytes()).await?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = tls.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() >= MAX_BYTES {
+            buf.truncate(MAX_BYTES);
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (status, headers_end) = parse_status_and_headers(&text)?;
+    Ok((status, headers_end, text))
+}
+
+/// 从响应里读状态码与"头部结束"的位置 ✓（纯函数 ✓ —— 所以它有测试 ✓✓）。
+fn parse_status_and_headers(text: &str) -> anyhow::Result<(u16, usize)> {
+    let line_end = text.find("\r\n").ok_or_else(|| anyhow!("no status line"))?;
+    let status: u16 = text[..line_end]
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("unreadable status line: {:?}", &text[..line_end.min(text.len())]))?;
+    // 头部与正文的分界 ✓；没有分界（被截断 ✓）就当作"全文都是头" ✓。
+    let headers_end = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
+    Ok((status, headers_end))
+}
+
+/// 从**响应头部**里取某个头 ✓（小写比较 ✓ —— HTTP 头不区分大小写 ✓）。
+/// ⚠️ 只在头部范围内找 ✓，免得把正文里恰好出现的 `location:` 当成跳转 ✓✗。
+fn header(head: &str, name: &str) -> Option<String> {
+    let want = format!("{}:", name.to_ascii_lowercase());
+    head.lines()
+        .find(|l| l.to_ascii_lowercase().starts_with(&want))
+        .map(|l| l[want.len()..].trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 #[cfg(test)]
