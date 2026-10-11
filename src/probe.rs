@@ -171,6 +171,72 @@ pub fn due(
     }
 }
 
+// ───────────────────────────── 状态：读写（落不了就如实退回内存）─────────────────────────────
+
+/// "上次探测时间"的存放处 ✓✓ —— **能落盘就落盘，落不了就退回内存并警告一次** ✓。
+///
+/// ⚠️ 为什么非要落盘 ✗：`Restart=always` 下 agent 崩溃重启循环时 ✓，
+/// "从没探过 ⇒ 立刻探"会变成**探测风暴** ✓✗（hub 那次 OOM 崩溃循环就是这个形状 ✓）。
+/// ⚠️ 而为什么"退回内存"也要明说 ✗：那种情况下**它确实会退化** ✓ ——
+/// 用户应当**知道** ✓，而不是以为"落盘了、稳了" ✓✗。所以降级时**警告一次** ✓（只一次 ✓，不刷屏 ✓）。
+pub struct State {
+    /// `None` = 拿不到可写目录 ✓（老安装 ✓ / 手动跑 ✓）⇒ 只放内存 ✓。
+    path: Option<std::path::PathBuf>,
+    /// 内存里的那份 ✓ —— 它是**权威**的（进程内），文件只是它的持久化 ✓。
+    memory: std::sync::Mutex<Option<std::time::SystemTime>>,
+    warned: std::sync::Once,
+}
+
+impl State {
+    /// `dir` 来自 [`state_dir`] ✓（`None` ⇒ 只放内存 ✓，并会在首次写入时警告一次 ✓）。
+    pub fn new(dir: Option<std::path::PathBuf>) -> Self {
+        Self { path: dir, memory: std::sync::Mutex::new(None), warned: std::sync::Once::new() }
+    }
+
+    /// 状态文件名 ✓（放在 [`State::new`] 给的目录里 ✓）。
+    fn file(&self) -> Option<std::path::PathBuf> {
+        Some(self.path.as_ref()?.join("last-probe"))
+    }
+
+    /// 上次探测时间 ✓ —— 内存里有就用它 ✓，否则读文件 ✓；读不出来（没有 / 坏了 ✓）⇒ `None` ✓。
+    /// ⚠️ **不猜** ✗：读不出来就让调用方按"从没探过"处理 ✓ —— 而那条路也要等过相位 ✓（见 [`due`] ✓）。
+    pub fn last(&self) -> Option<std::time::SystemTime> {
+        if let Some(t) = *self.memory.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Some(t);
+        }
+        let t = std::fs::read_to_string(self.file()?).ok().and_then(|s| parse_stamp(&s))?;
+        *self.memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+        Some(t)
+    }
+
+    /// 记下"刚探过" ✓ —— 内存一定更新 ✓（进程内立刻生效 ✓）；**同时尽力落盘** ✓。
+    /// ⚠️ 落盘失败**不是**错误返回 ✗：探测本身已经成功了 ✓，
+    /// 不该因为"写不进状态文件"就让这一次探测失败 ✓✗；但这**会让下次重启失去保护** ✓ ⇒ 警告一次 ✓。
+    pub fn remember(&self, at: std::time::SystemTime) {
+        *self.memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
+        let Some(path) = self.file() else {
+            self.warn_once("no writable state directory (StateDirectory= missing?)");
+            return;
+        };
+        let Some(text) = format_stamp(at) else {
+            return; // 早于 Unix 纪元的值 ✓（不该出现 ✓，写出去也会被读成 1970 ✓✗）
+        };
+        // ⚠️ **原子写** ✓：先写同目录的临时文件 ✓ 再 rename ✓ ——
+        // 直接截断写的话，崩在中间会留下半个文件 ✓，而它读出来是"从没探过" ✓✗（于是又探一次 ✓）。
+        let tmp = path.with_extension("tmp");
+        let ok = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path)).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp); // 别留下垃圾 ✓
+            self.warn_once("cannot write the probe state file; restart protection is degraded");
+        }
+    }
+
+    /// 降级警告**只打一次** ✓（崩溃重启循环里刷屏会把日志本身变成问题 ✓）。
+    fn warn_once(&self, msg: &str) {
+        self.warned.call_once(|| eprintln!("probe: {msg}"));
+    }
+}
+
 // ─────────────────────────── 取页（本模块唯一不可单测的部分）───────────────────────────
 
 /// 一次 HTTPS GET ✓ —— **只是把页面拿回来** ✓：它失败就是失败 ✓，绝不猜 ✓。
@@ -447,5 +513,67 @@ mod tests {
         assert_eq!(parse_stamp("1.5"), None);
         // 早于 Unix 纪元 ⇒ 写不出来 ✓（写 0 会被读成"1970 年探过" ✓✗）
         assert_eq!(format_stamp(SystemTime::UNIX_EPOCH - Duration::from_secs(1)), None);
+    }
+    /// 落盘 → 读回要**一致** ✓；换一个新进程（新 `State` 实例 ✓）也要读得到 ✓
+    /// —— 这才是"重启不风暴"真正依赖的东西 ✓✓。
+    #[test]
+    fn the_probe_stamp_survives_a_restart() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("monitor-probe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        let first = State::new(Some(dir.clone()));
+        assert_eq!(first.last(), None, "还没写过 ⇒ None ✓（不是 1970 ✓）");
+        first.remember(t);
+
+        // 换一个实例 = 新进程 ✓（内存是空的 ✓，只能靠文件 ✓）
+        let after_restart = State::new(Some(dir.clone()));
+        assert_eq!(after_restart.last(), Some(t), "重启后必须读得回来 ✓✓");
+        assert!(!dir.join("last-probe.tmp").exists(), "临时文件不该留下 ✓（它的存在会让人以为写失败了 ✓）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 拿不到目录 ⇒ 只放内存 ✓：**进程内仍然有效** ✓，但**不会**假装自己落盘了 ✓。
+    #[test]
+    fn without_a_directory_the_state_stays_in_memory_only() {
+        use std::time::{Duration, SystemTime};
+        let s = State::new(None);
+        assert_eq!(s.last(), None);
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        s.remember(t);
+        assert_eq!(s.last(), Some(t), "进程内必须立刻生效 ✓");
+        // ⚠️ 换一个实例就读不到了 ✓ —— 这正是"降级"的含义 ✓（会对用户警告一次 ✓）
+        assert_eq!(State::new(None).last(), None);
+    }
+
+    /// 状态文件读不出来 ⇒ `None` ✓（**不猜** ✗），而且**不能 panic** ✓。
+    ///
+    /// ⚠️ **一个刻意留下的判断，写在这里免得后人误会** ✗：文件里若是"**能解析但很旧**"的值
+    /// （半截写入恰好留下一个合法数字 ✓ —— 例如 `"17"` 就是纪元后 17 秒 ✓），
+    /// 本项目**不**去猜"这大概是坏的" ✓ ⇒ 它会读成一个 1970 年的时间 ✓ ⇒ [`due`] 说"该探了" ✓
+    /// ⇒ **最多多探一次** ✓ —— **不是风暴** ✓✓。
+    /// ⇒ 也就是说这个失败方向是**安全**的 ✓，所以不值得为它加"太旧就当没写"那种猜测逻辑 ✗
+    ///（那种猜测本身也可能猜错 ✓，而它换来的只是少探一次 ✓）。
+    #[test]
+    fn an_unreadable_state_file_is_treated_as_never_probed() {
+        let dir = std::env::temp_dir().join(format!("monitor-probe-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // ⚠️ 这里**不含**带末尾空白的输入 —— 那是**合法**的（`parse_stamp` 会 trim），
+        // 而"文件末尾多一个换行"恰恰是最常见的情形，所以要单独断言它**能**读出来。
+        for bad in ["", "abc", "-5", "1.5", "17x"] {
+            std::fs::write(dir.join("last-probe"), bad).unwrap();
+            assert_eq!(State::new(Some(dir.clone())).last(), None, "读不出来 ⇒ None ✓（内容 {bad:?}）");
+        }
+        // 与上面成对 ✓：末尾空白**必须**能读 ✓ —— 否则每次落盘都会被自己读成"没探过" ✓✗
+        std::fs::write(dir.join("last-probe"), "1700000000\n").unwrap();
+        assert_eq!(
+            State::new(Some(dir.clone())).last(),
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)),
+            "末尾换行是合法的 ✓"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
