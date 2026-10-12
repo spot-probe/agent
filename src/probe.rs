@@ -282,6 +282,45 @@ pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
 /// ⚠️ 写在两处会漂移 ✓：改了一处、另一处还是旧值 ✓，而那种不一致**不报错** ✓✗。
 const MAX_BYTES: usize = 512 * 1024;
 
+// ─────────────────────────────── Reddit（结论就是状态码）───────────────────────────────
+
+/// Reddit 要取的地址 ✓（照参考实现 ✓ —— 完整那一条 ✓）。
+pub const REDDIT_URL: &str = "https://www.reddit.com/svc/shreddit/reddit-chat";
+
+/// Reddit 的判据 ✓✓ —— 纯函数 ✓，输入是**状态码与正文** ✓。
+///
+/// 参考实现就是按状态码判的 ✓（它用 `--write-out '%{http_code}'` 取那个码 ✓）：
+/// - **200 ⇒ 解锁** ✓，地区从正文里的 `country="XX"` 取 ✓；
+/// - **403 ⇒ 未解锁** ✓✓ —— ⚠️ 这是 Reddit 表达"这个区不行"的方式 ✓，
+///   所以它**必须被当成结论** ✓✗（若把 403 当"取页失败" ✓，用户看到的是"还没测过" ✓✗，
+///   而真相是"**被拒了**" ✓ —— 两件事 ✓）；
+/// - **其它码 ⇒ 不猜** ✓（`Unknown` ✓）：那既不是"能用"也不是"被拒" ✓
+///   （例如 5xx ✓ —— 服务器自己的问题 ✓）。
+///
+/// ⚠️ 而这正是 [`fetch_status`] 存在的原因 ✗：普通 [`fetch`] 遇到非 200 就报错 ✓，
+/// 那会把 403 这个**明确的结论**变成"没连上" ✓✗。
+pub fn reddit_verdict(status: u16, body: &str) -> Verdict {
+    match status {
+        200 => Verdict { status: Status::Unlocked, region: reddit_region(body) },
+        403 => Verdict { status: Status::Blocked, region: None },
+        _ => Verdict { status: Status::Unknown, region: None },
+    }
+}
+
+/// 从正文里取地区 ✓（`country="XX"` ✓，照参考实现 ✓）——
+/// 形状检查照旧 ✓：**必须两位大写字母** ✓（否则别的 `country="…"` 会被当地区 ✓✗）。
+pub fn reddit_region(body: &str) -> Option<String> {
+    let i = body.find("country=\"")? + 9;
+    let rest = &body[i..];
+    let end = rest.find('"')?;
+    let code = &rest[..end];
+    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+        Some(code.to_string())
+    } else {
+        None
+    }
+}
+
 // ─────────────────────────────── TikTok（三档 + 机器人拦截）───────────────────────────────
 
 /// TikTok 要取的两个地址 ✓（照参考实现 ✓）：主站 ✓ 与"被拦截时换的那个" ✓。
@@ -379,6 +418,14 @@ pub async fn run() -> Option<serde_json::Value> {
         merge(&mut out, verdict_json("tiktok", &tiktok_verdict(&main, &second)));
     }
 
+    // Reddit ✓：⚠️ 它的结论**就是状态码** ✗（403 ⇒ 未解锁 ✓ / 200 ⇒ 解锁 ✓）——
+    // 所以这里用 [`fetch_status`] ✓（**不是** `fetch` ✓：后者遇非 200 直接报错 ✓，
+    // 那会把 403 这个**明确的结论**变成"没连上" ✓✗）。
+    // ⚠️ 而**连不上**（Err ✓）仍然什么都不报 ✓ —— 那才是真的"没读到" ✓✓。
+    if let Ok((status, body)) = fetch_status(REDDIT_URL, "").await {
+        merge(&mut out, verdict_json("reddit", &reddit_verdict(status, &body)));
+    }
+
     if out.is_empty() {
         None
     } else {
@@ -415,8 +462,15 @@ pub async fn fetch(url: &str) -> anyhow::Result<String> {
 
 /// 同 [`fetch`] ✓，但可以多带**一个请求头** ✓ —— TikTok 的第二次请求要用它区分"机房" ✓
 ///（参考实现就是靠换这段 Accept 头拿到不同结果的 ✓）。
-pub async fn fetch_with(url: &str, extra_header: &str) -> anyhow::Result<String> {
-    // 这些常量放在函数里，改动时只在一处 ✓。
+/// 同 [`fetch`] ✓，但**把最终状态码也带出来** ✓✓ —— 有些服务的结论**就是状态码** ✓
+///（Reddit：**403 ⇒ 未解锁** ✓ / **200 ⇒ 解锁** ✓ —— 见它的判据 ✓）。
+///
+/// ⚠️ 它**不因非 200 报错** ✗（那正是它存在的理由 ✓）；只有"连不上 / 读不出来 / 跳转太多"
+/// 才算失败 ✓✓ —— 这两件事必须分得开 ✓：**"对方拒绝了"是结论** ✓，**"我们没连上"不是** ✓。
+///
+/// ⚠️ **跳转照样跟随** ✓（与 `fetch` 同一套 ✓）：不跟的话读到的是跳转页 ✓，
+/// 而它的内容看起来也像正常页面 ✓✗ ⇒ 状态码与正文都会被带偏 ✓。
+pub async fn fetch_status(url: &str, extra_header: &str) -> anyhow::Result<(u16, String)> {
     const MAX_REDIRECTS: u8 = 3;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -425,20 +479,27 @@ pub async fn fetch_with(url: &str, extra_header: &str) -> anyhow::Result<String>
         let (status, headers_end, body) =
             tokio::time::timeout(TIMEOUT, get_once(&current, extra_header)).await??;
         if (300..400).contains(&status) {
-            // Location 头是跳转目标 ✓；没有就没什么可跟的 ✓。
             match header(&body[..headers_end.min(body.len())], "location") {
                 Some(loc) if loc.starts_with("https://") => current = loc,
                 Some(_) => anyhow::bail!("refusing a non-https redirect from {current}"),
-                None => return Ok(body),
+                // 跳转但没给目标 ⇒ 就当这是最终响应 ✓（状态码本身仍是信息 ✓）
+                None => return Ok((status, body)),
             }
             continue;
         }
-        if status != 200 {
-            anyhow::bail!("{current} answered HTTP {status}");
-        }
-        return Ok(body);
+        return Ok((status, body));
     }
     anyhow::bail!("too many redirects starting at {url}")
+}
+
+pub async fn fetch_with(url: &str, extra_header: &str) -> anyhow::Result<String> {
+    // ⚠️ 行为与从前**一字不变** ✓：非 200 一律算失败 ✓（Netflix 与 TikTok 的判据就是这样假设的 ✓）。
+    // 需要看状态码的服务走 [`fetch_status`] ✓ —— 两条路各取所需 ✓，谁也不改变谁 ✓。
+    let (status, body) = fetch_status(url, extra_header).await?;
+    if status != 200 {
+        anyhow::bail!("{url} answered HTTP {status}");
+    }
+    Ok(body)
 }
 
 /// 发一次请求并读回（**最多** `MAX_BYTES` ✓）。返回 `(状态码, 头部结束位置, 全文)`。
@@ -865,5 +926,39 @@ mod tests {
             verdict_json("tiktok", &v),
             serde_json::json!({"tiktok": {"status": "idc", "region": "US"}})
         );
+    }
+    /// ⭐⭐ **403 是结论，不是失败** ✓✓ —— 这是 Reddit 这一块最要紧的一条 ✗：
+    /// 把 403 当"取页失败" ⇒ 面板显示"还没测过" ✓✗，而真相是"**被拒了**" ✓ ——
+    /// 两件事的处置完全不同 ✓（一个要换机器 ✓，一个只要再等等 ✓）。
+    #[test]
+    fn reddit_reads_the_status_code_as_the_verdict() {
+        // 200 ⇒ 解锁 ✓，地区从 body 取 ✓
+        assert_eq!(
+            reddit_verdict(200, "… country=\"JP\" …"),
+            Verdict { status: Status::Unlocked, region: Some("JP".into()) }
+        );
+        // 403 ⇒ **未解锁** ✓✓（不是 Unknown ✗）
+        assert_eq!(reddit_verdict(403, ""), Verdict { status: Status::Blocked, region: None });
+        // 其它码 ⇒ 不猜 ✓（5xx 是服务器的问题 ✓，不是关于这个 IP 的结论 ✓）
+        assert_eq!(reddit_verdict(500, "").status, Status::Unknown);
+        assert_eq!(reddit_verdict(302, "").status, Status::Unknown);
+        assert_eq!(reddit_verdict(0, "").status, Status::Unknown);
+    }
+
+    /// 200 但**没有地区** ⇒ 仍然算**解锁** ✓（地区拿不到就 `None` ✓ —— **不因为缺一格就改判** ✗）；
+    /// 而地区形状不对 ⇒ 同样只丢地区 ✓（与 Netflix/TikTok 同一条规矩 ✓）。
+    #[test]
+    fn reddit_unlocked_survives_a_missing_or_odd_region() {
+        assert_eq!(
+            reddit_verdict(200, "<html>no country here</html>"),
+            Verdict { status: Status::Unlocked, region: None }
+        );
+        for bad in ["country=\"jp\"", "country=\"JPN\"", "country=\"\""] {
+            assert_eq!(
+                reddit_verdict(200, bad),
+                Verdict { status: Status::Unlocked, region: None },
+                "{bad:?} 不该被当成地区 ✓，但状态仍是解锁 ✓"
+            );
+        }
     }
 }
