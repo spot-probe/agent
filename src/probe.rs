@@ -22,6 +22,11 @@ pub enum Status {
     /// 请求拿到了页面 ✓，但**内容看不懂** ✓（对方改版 / 返回了别的东西 ✓）
     /// ⚠️ 与 `Blocked` 分开 ✓：它**不是**"被墙"的结论 ✓，只是"这次没读明白" ✓。
     Unknown,
+    /// **只有网页能用** ✓✓（用户定的第五档 ✓）：ChatGPT 会分别探 API 与 iOS 端 ✓，
+    /// 于是可能出现"网页能开、App 打不开" ✓ —— 这既不是解锁 ✓，也不是未解锁 ✓。
+    Web,
+    /// **只有 App 能用** ✓✓（第六档 ✓）：与 [`Status::Web`] 相对 ✓。
+    App,
     /// **解锁、但对方把这个地址识别成机房** ✓✓（用户定的第四档 ✓）。
     /// ⚠️ 它与 `Unlocked` **不是一回事** ✗：机房 IP 在很多服务上吃亏 ✓，
     /// 而这正是运维想知道的 ✓；也与 `Blocked` 不同 ✓ ⇒ 独立一档 ✓。
@@ -268,6 +273,8 @@ pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
         Status::Blocked => "blocked",
         Status::Unknown => "unknown",
         Status::Idc => "idc",
+        Status::Web => "web",
+        Status::App => "app",
     };
     let mut item = serde_json::Map::new();
     item.insert("status".into(), serde_json::json!(status));
@@ -281,6 +288,57 @@ pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
 /// 一次响应最多读多少字节 ✓ —— **一处定义** ✓（`fetch` 与 `get_once` 都用它 ✓）。
 /// ⚠️ 写在两处会漂移 ✓：改了一处、另一处还是旧值 ✓，而那种不一致**不报错** ✓✗。
 const MAX_BYTES: usize = 512 * 1024;
+
+// ─────────────────────────── ChatGPT（四档：能用的那一边不一样）───────────────────────────
+
+/// ChatGPT 要探的三个地址 ✓（照参考实现 ✓）。
+pub const CHATGPT_API: &str = "https://api.openai.com/compliance/cookie_requirements";
+pub const CHATGPT_IOS: &str = "https://ios.chat.openai.com/";
+pub const CHATGPT_FAVICON: &str = "https://chatgpt.com/favicon.ico";
+pub const CHATGPT_TRACE: &str = "https://chat.openai.com/cdn-cgi/trace";
+
+/// ChatGPT 的判据 ✓✓ —— 纯函数 ✓，输入是**两段响应 + favicon 的状态码** ✓。
+///
+/// 参考实现的做法 ✓（逐行读出来的 ✓）：
+/// - `api…` 的响应里出现 `unsupported_country` ⇒ API 那边**不支持这个国家** ✓；
+///   ⚠️ 而参考**还要再看一眼** `chatgpt.com/favicon.ico` 是不是 **403** ✓✓ ——
+///   只有 403 才认定前者有效 ✓（那一层是**二次确认** ✓：单凭一个字符串会误判 ✓✗）；
+/// - `ios.chat.openai.com/` 的响应里出现 `VPN` ⇒ iOS 那边把这个地址当成 VPN ✓；
+/// - 两者都"没问题" ⇒ **解锁** ✓；都有问题 ⇒ **未解锁** ✓；
+/// - ⚠️ **只有 iOS 有问题** ⇒ **`web`** ✓✓（"网页能用、App 不行" ✓）；
+///   **只有 API 有问题** ⇒ **`app`** ✓✓（反过来 ✓）—— 这两档**既不是解锁也不是未解锁** ✗
+///   ⇒ 合并任何一边都是丢信息 ✓（用户定的"甲" ✓）。
+///
+/// ⚠️ **地区**由 [`chatgpt_region`] 从 trace 里取 ✓（**不在这条判据里** ✓ ——
+/// 那一份是另一次请求 ✓，它的成败不该影响"能不能用"这个结论 ✓✓）。
+pub fn chatgpt_verdict(api_body: &str, ios_body: &str, favicon_status: u16) -> Verdict {
+    // ⚠️ 二次确认就在这一行 ✓：字符串 + favicon 403 **两者都成立**才算 API 那边不支持 ✓
+    let api_bad = api_body.contains("unsupported_country") && favicon_status == 403;
+    let ios_bad = ios_body.contains("VPN");
+    let status = match (api_bad, ios_bad) {
+        (false, false) => Status::Unlocked,
+        (true, true) => Status::Blocked,
+        // ⚠️ 只有 iOS 有问题 ⇒ **网页能用** ✓（API 是网页那一边 ✓）
+        (false, true) => Status::Web,
+        // ⚠️ 只有 API 有问题 ⇒ **App 能用** ✓
+        (true, false) => Status::App,
+    };
+    Verdict { status, region: None }
+}
+
+/// 从 Cloudflare 的 trace 里取地区 ✓（`loc=XX` ✓ —— 参考实现就是这么取的 ✓）。
+/// 形状检查照旧 ✓：**必须两位大写字母** ✓（`loc=` 后面可能还有别的东西 ✓✗）。
+pub fn chatgpt_region(trace: &str) -> Option<String> {
+    let i = trace.find("loc=")? + 4;
+    let rest = &trace[i..];
+    let end = rest.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(rest.len());
+    let code = &rest[..end];
+    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+        Some(code.to_string())
+    } else {
+        None
+    }
+}
 
 // ─────────────────────────────── Reddit（结论就是状态码）───────────────────────────────
 
@@ -424,6 +482,19 @@ pub async fn run() -> Option<serde_json::Value> {
     // ⚠️ 而**连不上**（Err ✓）仍然什么都不报 ✓ —— 那才是真的"没读到" ✓✓。
     if let Ok((status, body)) = fetch_status(REDDIT_URL, "").await {
         merge(&mut out, verdict_json("reddit", &reddit_verdict(status, &body)));
+    }
+
+    // ChatGPT ✓：两段响应的**内容** + favicon 的**状态码**（二次确认 ✓），
+    // 地区来自**另一次**请求（trace ✓）—— ⚠️ 它取不到**不影响**"能不能用"这个结论 ✓✓。
+    let (api, ios) = tokio::join!(fetch(CHATGPT_API), fetch(CHATGPT_IOS));
+    if let (Ok(api), Ok(ios)) = (api, ios) {
+        // favicon 只**看状态码** ✓ ⇒ 用 `fetch_status` ✓（非 200 是它的正常取值之一 ✓，不是失败 ✓）
+        let favicon = fetch_status(CHATGPT_FAVICON, "").await.map(|(s, _)| s).unwrap_or(0);
+        let mut v = chatgpt_verdict(&api, &ios, favicon);
+        if let Ok(trace) = fetch(CHATGPT_TRACE).await {
+            v.region = chatgpt_region(&trace);
+        }
+        merge(&mut out, verdict_json("chatgpt", &v));
     }
 
     if out.is_empty() {
@@ -960,5 +1031,44 @@ mod tests {
                 "{bad:?} 不该被当成地区 ✓，但状态仍是解锁 ✓"
             );
         }
+    }
+    /// ⭐⭐ ChatGPT 的**四档** ✓✓ —— 而其中两档是"只通一边" ✓：
+    /// ⚠️ 把它们并进"解锁"会让"网页能开但 App 打不开"看起来完全正常 ✓✗ ——
+    /// 而那正是运维会据以决定要不要换机器的事实之一 ✓。
+    #[test]
+    fn chatgpt_keeps_the_four_tiers_apart() {
+        let clean_api = "{\"ok\":true}";
+        let bad_api = "{\"error\":\"unsupported_country\"}";
+        let clean_ios = "<html>hello</html>";
+        let bad_ios = "<html>VPN detected</html>";
+        // 都干净 ⇒ 解锁 ✓；都有问题（且 favicon 也是 403 ✓）⇒ 未解锁 ✓
+        assert_eq!(chatgpt_verdict(clean_api, clean_ios, 200).status, Status::Unlocked);
+        assert_eq!(chatgpt_verdict(bad_api, bad_ios, 403).status, Status::Blocked);
+        // ⚠️ 只有 iOS 有问题 ⇒ **网页能用** ✓；只有 API 有问题 ⇒ **App 能用** ✓
+        assert_eq!(chatgpt_verdict(clean_api, bad_ios, 200).status, Status::Web);
+        assert_eq!(chatgpt_verdict(bad_api, clean_ios, 403).status, Status::App);
+    }
+
+    /// ⚠️⚠️ **favicon 的 403 是"二次确认"** ✓✓ —— 少了它，API 响应里**随便一个字符串**
+    /// 就能把一台好机器判成"不支持这个国家" ✓✗（而那是个**看起来很合理**的错值 ✓）。
+    #[test]
+    fn the_api_verdict_needs_the_favicon_403_confirmation() {
+        let bad_api = "unsupported_country";
+        // favicon 不是 403 ⇒ **那个字符串不算数** ✓ ⇒ 仍然按"API 没问题"处理 ✓
+        // ⚠️ **必须大写 `VPN`** ✗✓ —— 判据是 `contains("VPN")`（照参考实现 ✓），
+        // 而 fixture 里写小写会静默落进另一档 ✓✗（我第一版就是这么写错的 ✓，被按名字跑抓到 ✓）。
+        assert_eq!(chatgpt_verdict(bad_api, "<html>VPN</html>", 200).status, Status::Web);
+        assert_eq!(chatgpt_verdict(bad_api, "<html>ok</html>", 404).status, Status::Unlocked);
+        // 只有 403 才认 ✓
+        assert_eq!(chatgpt_verdict(bad_api, "<html>ok</html>", 403).status, Status::App);
+    }
+
+    /// 地区取 Cloudflare trace 的 `loc=XX` ✓ —— 形状检查照旧 ✓（两位大写 ✓）。
+    #[test]
+    fn chatgpt_regions_come_from_the_trace_and_must_look_like_regions() {
+        assert_eq!(chatgpt_region("ip=1.2.3.4\nloc=JP\nts=1\n").as_deref(), Some("JP"));
+        assert_eq!(chatgpt_region("loc=jp"), None, "小写不算 ✓");
+        assert_eq!(chatgpt_region("loc=JPN"), None, "三位不算 ✓");
+        assert_eq!(chatgpt_region("ip=1.2.3.4\n"), None, "没有就别说 ✓");
     }
 }
