@@ -27,6 +27,12 @@ pub enum Status {
     Web,
     /// **只有 App 能用** ✓✓（第六档 ✓）：与 [`Status::Web`] 相对 ✓。
     App,
+    /// **中国版** ✓✓（第七档 ✓）：YouTube 的响应来自 `www.google.cn` ✓
+    ///（参考实现把地区**硬写成 `[CN]`** ✓ —— 那不是猜的 ✓，是"它给的就是中国版"这个事实 ✓）。
+    Cn,
+    /// **能用，但 Premium 会员买不到** ✓✓（第八档 ✓）：
+    /// 视频能看 ✓，只是这个国家不卖会员 ✓ —— ⚠️ 它**能用** ✗，别当成"没解锁" ✓✗。
+    NoPrem,
     /// **解锁、但对方把这个地址识别成机房** ✓✓（用户定的第四档 ✓）。
     /// ⚠️ 它与 `Unlocked` **不是一回事** ✗：机房 IP 在很多服务上吃亏 ✓，
     /// 而这正是运维想知道的 ✓；也与 `Blocked` 不同 ✓ ⇒ 独立一档 ✓。
@@ -275,6 +281,8 @@ pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
         Status::Idc => "idc",
         Status::Web => "web",
         Status::App => "app",
+        Status::Cn => "cn",
+        Status::NoPrem => "noprem",
     };
     let mut item = serde_json::Map::new();
     item.insert("status".into(), serde_json::json!(status));
@@ -288,6 +296,58 @@ pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
 /// 一次响应最多读多少字节 ✓ —— **一处定义** ✓（`fetch` 与 `get_once` 都用它 ✓）。
 /// ⚠️ 写在两处会漂移 ✓：改了一处、另一处还是旧值 ✓，而那种不一致**不报错** ✓✗。
 const MAX_BYTES: usize = 512 * 1024;
+
+// ─────────────────────── YouTube（四档；其中两档是"能用但有条件"）───────────────────────
+
+/// YouTube 要取的地址 ✓（照参考实现 ✓ —— 它带一串 cookie 与 `Accept-Language: en` ✓）。
+pub const YOUTUBE_URL: &str = "https://www.youtube.com/premium";
+
+/// 那两个请求头 ✓（⚠️ 参考里**必须有** ✓ —— 不带 `Accept-Language: en` 时页面语言不同 ✓，
+/// 判据里那几个字符串就对不上了 ✓✗）。多行头块 ✓（[`fetch_with`] 会把整段塞进请求 ✓）。
+pub const YOUTUBE_HEADERS: &str = "Accept-Language: en\r\nCookie: YSC=BiCUU3-5Gdk; CONSENT=YES+cb.20220301-11-p0.en+FX+700; GPS=1; VISITOR_INFO1_LIVE=4VwPMkB7W5A; PREF=tz=Asia.Shanghai; _gcl_au=1.1.1809531354.1646633279";
+
+/// YouTube 的判据 ✓✓ —— 纯函数 ✓。
+///
+/// 参考实现的做法 ✓（逐行读出来的 ✓），顺序**刻意如此** ✗：
+/// 1. 响应里出现 `www.google.cn` ⇒ **中国版**（[`Status::Cn`] ✓，地区 `CN` ✓）；
+/// 2. 出现 `Premium is not available in your country` ⇒ **能用但买不到会员**
+///    （[`Status::NoPrem`] ✓✓ —— ⚠️ 它**能用** ✗）；
+/// 3. 出现 `ad-free` 且能取到 `"contentRegion":"XX"` ⇒ **解锁** ✓（地区就是它 ✓）；
+/// 4. 出现 `ad-free` 但**取不到地区** ⇒ **仍然解锁** ✓✓（地区留空 ✓ ——
+///    **不因为缺一格就改判** ✓，与 Netflix/Reddit 同一条规矩 ✓）；
+/// 5. 其它 ⇒ **不猜** ✓（`Unknown` ✓ —— 既不是"能用"也不是"不能用" ✓）。
+///
+/// ⚠️ 1 与 2 必须**排在** 3 前面 ✗：中国版页面里也可能有 `ad-free` 字样 ✓，
+/// 先看 `ad-free` 就会把中国那一档判成"解锁" ✓✗（一个**看起来很合理**的错值 ✓）。
+pub fn youtube_verdict(body: &str) -> Verdict {
+    if body.contains("www.google.cn") {
+        return Verdict { status: Status::Cn, region: Some("CN".into()) };
+    }
+    if body.contains("Premium is not available in your country") {
+        return Verdict { status: Status::NoPrem, region: None };
+    }
+    if body.contains("ad-free") {
+        return Verdict { status: Status::Unlocked, region: youtube_region(body) };
+    }
+    Verdict { status: Status::Unknown, region: None }
+}
+
+/// 从页面里取 `"contentRegion":"XX"` ✓ —— 形状检查照旧 ✓（两位大写 ✓）。
+pub fn youtube_region(body: &str) -> Option<String> {
+    let i = body.find("\"contentRegion\"")? + "\"contentRegion\"".len();
+    let rest = &body[i..];
+    let colon = rest.find(':')?;
+    let after_colon = &rest[colon + 1..];
+    let q = after_colon.find('"')?;
+    let after = &after_colon[q + 1..];
+    let end = after.find('"')?;
+    let code = &after[..end];
+    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+        Some(code.to_string())
+    } else {
+        None
+    }
+}
 
 // ───────────────────────────── AmazonPV（最干净的一个：一页定生死）─────────────────────────────
 
@@ -543,6 +603,11 @@ pub async fn run() -> Option<serde_json::Value> {
     // AmazonPV ✓：最干净的一个 ✓ —— 一个 GET、一个字段、三个既有状态 ✓✓。
     if let Ok(body) = fetch(AMAZONPV_URL).await {
         merge(&mut out, verdict_json("amazonpv", &amazonpv_verdict(&body)));
+    }
+
+    // YouTube ✓：要带那两个头 ✓（否则页面上那几个字符串对不上 ✓✗）。
+    if let Ok(body) = fetch_with(YOUTUBE_URL, YOUTUBE_HEADERS).await {
+        merge(&mut out, verdict_json("youtube", &youtube_verdict(&body)));
     }
 
     if out.is_empty() {
@@ -1143,5 +1208,47 @@ mod tests {
         assert_eq!(amazonpv_region(r#""currentTerritory":"USA""#), None, "三位不算 ✓");
         assert_eq!(amazonpv_region(r#""currentTerritory":"""#), None, "空不算 ✓");
         assert_eq!(amazonpv_region("nothing"), None, "没有就别说 ✓");
+    }
+    /// ⭐⭐ **顺序**是这一块最容易错的地方 ✗✗：中国版的页面里**也可能**出现 `ad-free` 字样 ✓
+    /// ⇒ 若先看 `ad-free` ✓，中国那一档就会被判成"解锁" ✓✗（一个**看起来很合理**的错值 ✓）。
+    #[test]
+    fn youtube_checks_the_china_domain_before_ad_free() {
+        let both = "<html>www.google.cn … ad-free …</html>";
+        assert_eq!(
+            youtube_verdict(both).status,
+            Status::Cn,
+            "两者都有时必须判中国版 ✓ —— 先看 ad-free 会误判成解锁 ✓✗"
+        );
+        // 而"买不到会员"也要**排在** ad-free 前面 ✓：那一页里同样可能有 ad-free 字样 ✓
+        let noprem = "<html>ad-free Premium is not available in your country</html>";
+        assert_eq!(youtube_verdict(noprem).status, Status::NoPrem);
+    }
+
+    /// YouTube 的四档 ✓ + ⚠️ **"有 ad-free 但取不到地区"仍然算解锁** ✓✓
+    ///（不因为缺一格就改判 ✓ —— 与 Netflix/Reddit 同一条规矩 ✓）。
+    #[test]
+    fn youtube_keeps_unlocked_even_without_a_region() {
+        assert_eq!(
+            youtube_verdict(r#"<html>"contentRegion":"JP" ad-free</html>"#),
+            Verdict { status: Status::Unlocked, region: Some("JP".into()) }
+        );
+        assert_eq!(
+            youtube_verdict("<html>ad-free</html>"),
+            Verdict { status: Status::Unlocked, region: None },
+            "没有地区不改判 ✓"
+        );
+        // 什么都没有 ⇒ 不猜 ✓（既不是能用也不是不能用 ✓）
+        assert_eq!(youtube_verdict("<html>nothing</html>").status, Status::Unknown);
+    }
+
+    /// 地区形状 ✓（两位大写 ✓）+ **键名自己的引号不算值** ✓
+    ///（AmazonPV 那一笔就是踩了它 ✓ —— 这里照修好的写法 ✓）。
+    #[test]
+    fn youtube_regions_must_look_like_regions() {
+        assert_eq!(youtube_region(r#""contentRegion":"US""#).as_deref(), Some("US"));
+        assert_eq!(youtube_region(r#""contentRegion": "us""#), None, "小写不算 ✓");
+        assert_eq!(youtube_region(r#""contentRegion":"USA""#), None, "三位不算 ✓");
+        assert_eq!(youtube_region(r#""contentRegion":"""#), None, "空不算 ✓");
+        assert_eq!(youtube_region("nothing"), None, "没有就别说 ✓");
     }
 }
