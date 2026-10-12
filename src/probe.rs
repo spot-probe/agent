@@ -289,6 +289,49 @@ pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
 /// ⚠️ 写在两处会漂移 ✓：改了一处、另一处还是旧值 ✓，而那种不一致**不报错** ✓✗。
 const MAX_BYTES: usize = 512 * 1024;
 
+// ───────────────────────────── AmazonPV（最干净的一个：一页定生死）─────────────────────────────
+
+/// Amazon Prime Video 要取的地址 ✓（照参考实现 ✓ —— 一个普通 GET ✓）。
+pub const AMAZONPV_URL: &str = "https://www.primevideo.com";
+
+/// AmazonPV 的判据 ✓✓ —— 纯函数 ✓，而且**只用得着三个既有状态** ✓✓
+///（不需要任何新档 ✓ —— 这一期里唯一一个这样的服务 ✓）。
+///
+/// 参考实现的做法 ✓：从 `https://www.primevideo.com` 的响应里取
+/// `"currentTerritory": "XX"` ✓ —— **有 ⇒ 解锁** ✓（地区就是它 ✓）；**没有 ⇒ 未解锁** ✓。
+///
+/// ⚠️ 而"取页失败"**不在这里** ✗：那是调用方的事 ✓（连不上 ⇒ **不报** ✓✗，
+/// 因为一次网络故障不是结论 ✓ —— 与 Netflix/TikTok 同一条规矩 ✓）。
+pub fn amazonpv_verdict(body: &str) -> Verdict {
+    match amazonpv_region(body) {
+        Some(r) => Verdict { status: Status::Unlocked, region: Some(r) },
+        None => Verdict { status: Status::Blocked, region: None },
+    }
+}
+
+/// 从响应里取 `"currentTerritory": "XX"` ✓。
+/// ⚠️ 形状检查照旧 ✓：**必须两位大写字母** ✓ —— 那两个键名附近还有别的字段 ✓，
+/// 不检查形状就会把别的值当地区 ✓✗（一个"看起来很正常"的错值 ✓）。
+pub fn amazonpv_region(body: &str) -> Option<String> {
+    // ⚠️⚠️ `find("\"currentTerritory\"")` 命中的位置**就是那个左引号本身** ✗
+    // ⇒ 若从那里再找下一个引号 ✓，取到的是**键名**（`currentTerritory` ✓）而不是值 ✓✗。
+    // ⭐ 这正是两条测试第一版双双失败的原因 ✓（测试是对的 ✓，实现是错的 ✓）。
+    // 正确做法 ✓：从**键名之后**继续找 ✓ —— 先找 `:` ✓，再找它后面的第一个引号 ✓。
+    let i = body.find("\"currentTerritory\"")? + "\"currentTerritory\"".len();
+    let rest = &body[i..];
+    let colon = rest.find(':')?;
+    let after_colon = &rest[colon + 1..];
+    let q = after_colon.find('"')?; // 中间允许空白 ✓（参考的正则就是允许的 ✓）
+    let after = &after_colon[q + 1..];
+    let end = after.find('"')?;
+    let code = &after[..end];
+    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+        Some(code.to_string())
+    } else {
+        None
+    }
+}
+
 // ─────────────────────────── ChatGPT（四档：能用的那一边不一样）───────────────────────────
 
 /// ChatGPT 要探的三个地址 ✓（照参考实现 ✓）。
@@ -495,6 +538,11 @@ pub async fn run() -> Option<serde_json::Value> {
             v.region = chatgpt_region(&trace);
         }
         merge(&mut out, verdict_json("chatgpt", &v));
+    }
+
+    // AmazonPV ✓：最干净的一个 ✓ —— 一个 GET、一个字段、三个既有状态 ✓✓。
+    if let Ok(body) = fetch(AMAZONPV_URL).await {
+        merge(&mut out, verdict_json("amazonpv", &amazonpv_verdict(&body)));
     }
 
     if out.is_empty() {
@@ -1070,5 +1118,30 @@ mod tests {
         assert_eq!(chatgpt_region("loc=jp"), None, "小写不算 ✓");
         assert_eq!(chatgpt_region("loc=JPN"), None, "三位不算 ✓");
         assert_eq!(chatgpt_region("ip=1.2.3.4\n"), None, "没有就别说 ✓");
+    }
+    /// AmazonPV 的三个情形 ✓（这一期里唯一**不需要新档**的服务 ✓）：
+    /// 有地区 ⇒ 解锁 ✓ · 没有 ⇒ **未解锁** ✓（不是"没读到" ✓）· 连不上 ⇒ 由调用方不报 ✓。
+    #[test]
+    fn amazonpv_reads_the_territory_field() {
+        assert_eq!(
+            amazonpv_verdict(r#"…"currentTerritory": "JP"…"#),
+            Verdict { status: Status::Unlocked, region: Some("JP".into()) }
+        );
+        // 页面取到了、但**没有**那个字段 ⇒ 未解锁 ✓（页面正常返回就是"对方给了答案" ✓）
+        assert_eq!(
+            amazonpv_verdict("<html>no territory here</html>"),
+            Verdict { status: Status::Blocked, region: None }
+        );
+    }
+
+    /// ⚠️ 形状检查要挡住"看起来像地区"的别的值 ✓（键名附近还有别的字段 ✓）——
+    /// 而**拿到了但形状不对**时，仍然按"没有地区"处理 ✓ ⇒ **未解锁** ✓（与"没有"同一路 ✓）。
+    #[test]
+    fn amazonpv_regions_must_look_like_regions() {
+        assert_eq!(amazonpv_region(r#""currentTerritory":"US""#).as_deref(), Some("US"));
+        assert_eq!(amazonpv_region(r#""currentTerritory": "us""#), None, "小写不算 ✓");
+        assert_eq!(amazonpv_region(r#""currentTerritory":"USA""#), None, "三位不算 ✓");
+        assert_eq!(amazonpv_region(r#""currentTerritory":"""#), None, "空不算 ✓");
+        assert_eq!(amazonpv_region("nothing"), None, "没有就别说 ✓");
     }
 }
