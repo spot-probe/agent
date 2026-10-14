@@ -83,23 +83,37 @@ pub fn netflix_verdict(page_a: &str, page_b: &str) -> Verdict {
     } else {
         Status::Unlocked
     };
-    Verdict { status, region: netflix_region(page_a).or_else(|| netflix_region(page_b)) }
+    // 地区只在能用那两档给：参考里 blocked 与 failed 都不给地区。
+    // 给的话会让人以为这台机器还能看某些内容，而它其实什么也看不了。
+    let region = match status {
+        Status::Unlocked | Status::Org => netflix_region(page_a).or_else(|| netflix_region(page_b)),
+        _ => None,
+    };
+    Verdict { status, region }
 }
 
 /// 从页面里取地区码 ✓（`"id":"US"` 紧邻 `"countryName"` 的那一处 ✓，照参考的正则 ✓）。
 /// 取不到 ⇒ `None` ✓（**不编** ✗）。
 fn netflix_region(page: &str) -> Option<String> {
-    let i = page.find("\"id\":\"")?;
-    let rest = &page[i + 6..];
-    let end = rest.find('"')?;
-    let code = &rest[..end];
-    // 参考用的是"`"id"` 后面紧跟 `"countryName"` 之前"这个形状 ✓；
-    // 这里再加两道保险 ✓：**必须是两位大写字母** ✓（否则它只是别的 `id` 字段 ✓）。
-    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
-        Some(code.to_string())
-    } else {
-        None
+    // 取最后一处：参考那行是 sed 的贪婪匹配，拿到的就是最后一处。
+    // 与 YouTube / TikTok 同一规矩（先给值、后给空 的页面会分叉）。
+    // 形状检查照旧：必须两位大写，否则那只是别的 id 字段。
+    // 参考还要求 id 与 countryName 相邻，这一条刻意没跟（更宽松，但靠形状兜住）。
+    const KEY: &str = "\"id\":\"";
+    let mut found: Option<String> = None;
+    let mut from = 0usize;
+    while let Some(i) = page[from..].find(KEY) {
+        let start = from + i + KEY.len();
+        from = start;
+        let Some(end) = page[start..].find('"') else { continue };
+        let code = &page[start..start + end];
+        found = if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+            Some(code.to_string())
+        } else {
+            None
+        };
     }
+    found
 }
 
 /// 抖动的**种子**来自一个稳定的、非密钥的标识 ✓ —— 纯函数 ✓（所以"稳不稳定"能测 ✓）。
@@ -620,15 +634,21 @@ pub fn reddit_verdict(status: u16, body: &str) -> Verdict {
 /// 从正文里取地区 ✓（`country="XX"` ✓，照参考实现 ✓）——
 /// 形状检查照旧 ✓：**必须两位大写字母** ✓（否则别的 `country="…"` 会被当地区 ✓✗）。
 pub fn reddit_region(body: &str) -> Option<String> {
-    let i = body.find("country=\"")? + 9;
-    let rest = &body[i..];
-    let end = rest.find('"')?;
-    let code = &rest[..end];
-    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
-        Some(code.to_string())
-    } else {
-        None
+    // 取第一个有效的：参考是 grep -oE 全部匹配，再 grep -m1 .（第一个非空）。
+    // 形状检查照旧且更严：必须两位大写（参考只要求非空；这一条是刻意收紧的）。
+    // 差别只在 第一处是空、第二处有值 时：参考拿第二个，我们先前直接放弃。
+    const KEY: &str = "country=\"";
+    let mut from = 0usize;
+    while let Some(i) = body[from..].find(KEY) {
+        let start = from + i + KEY.len();
+        from = start;
+        let Some(end) = body[start..].find('"') else { continue };
+        let code = &body[start..start + end];
+        if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+            return Some(code.to_string());
+        }
     }
+    None
 }
 
 // ─────────────────────────────── TikTok（三档 + 机器人拦截）───────────────────────────────
@@ -1187,7 +1207,10 @@ mod tests {
             &page("<html>Oh no!</html>"),
         );
         assert_eq!(v.status, Status::Unknown, "只有一页 ⇒ 没读明白 ✓，不是未解锁 ✗");
-        assert_eq!(v.region.as_deref(), Some("US"), "但读到的地区照样给出来 ✓");
+        // ⚠️ 地区**不再**跟着出来 ✓（这一条正是丁的必然结果 ✓）：
+        // 参考里 blocked 与 failed 都**不给**地区 ✓ —— 给了会让人以为"还能看某些内容" ✓✗。
+        // ⇒ 只有 Unlocked / Org 两档才带地区 ✓。
+        assert_eq!(v.region, None, "说不清的时候不给地区 ✓（给了就成了『还能看』的暗示 ✓✗）");
     }
 
     /// 两页都正常 ⇒ **解锁** ✓，并取到地区 ✓。
@@ -1888,5 +1911,33 @@ mod tests {
             1,
             "大写给小写都得只发一个 ✓"
         );
+    }
+
+    /// 取最后一处：参考那行是贪婪匹配。与 YouTube / TikTok 同一规矩。
+    #[test]
+    fn netflix_region_takes_the_last_one() {
+        assert_eq!(
+            netflix_region(
+                r#"{"id":"US","countryName":"United States"} … {"id":"JP","countryName":"Japan"}"#
+            )
+            .as_deref(),
+            Some("JP"),
+            "两处都有 ⇒ 取最后一处 ✓"
+        );
+        assert_eq!(netflix_region(r#"{"id":"US"} {"id":""}"#), None, "最后一处不合法 ⇒ 取不到 ✓");
+        assert_eq!(netflix_region(r#"{"id":"us"}"#), None, "小写不算 ✓");
+        assert_eq!(netflix_region("nothing here"), None);
+    }
+
+    /// 取第一个有效的：参考是第一个非空。差别只在 第一处是空、第二处有值。
+    #[test]
+    fn reddit_region_takes_the_first_usable_one() {
+        assert_eq!(
+            reddit_region(r#"country="" … country="JP""#).as_deref(),
+            Some("JP"),
+            "第一处是空 ⇒ 必须继续找，而不是放弃 ✓"
+        );
+        assert_eq!(reddit_region(r#"country="US" country="JP""#).as_deref(), Some("US"), "第一个有效 ✓");
+        assert_eq!(reddit_region(r#"country="jp" country="JPN""#), None, "都不合法 ⇒ 不给 ✓");
     }
 }
