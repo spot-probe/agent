@@ -345,7 +345,9 @@ pub const YOUTUBE_HEADERS: &str = "Accept-Language: en\r\nCookie: YSC=BiCUU3-5Gd
 /// YouTube 的判据 ✓✓ —— 纯函数 ✓。
 ///
 /// 参考实现的做法 ✓（逐行读出来的 ✓），顺序**刻意如此** ✗：
-/// 1. 响应里出现 `www.google.cn` ⇒ **中国版**（[`Status::Cn`] ✓，地区 `CN` ✓）；
+/// 1. ⚠️ **中国版不在这个函数里** ✗✓ —— 它由**最终落在哪个主机**判定 ✓
+///    （[`youtube_is_cn_final`] ✓，调用方先判它 ✓，地区硬写 `CN` ✓）；
+///    ⭐ 从前这里是"响应里出现 `www.google.cn`" ✗，而那是个**误报的来源** ✓（见那个函数的注释 ✓）；
 /// 2. 出现 `Premium is not available in your country` ⇒ **能用但买不到会员**
 ///    （[`Status::NoPrem`] ✓✓ —— ⚠️ 它**能用** ✗）；
 /// 3. 出现 `ad-free` 且能取到 `"contentRegion":"XX"` ⇒ **解锁** ✓（地区就是它 ✓）；
@@ -359,9 +361,9 @@ pub const YOUTUBE_HEADERS: &str = "Accept-Language: en\r\nCookie: YSC=BiCUU3-5Gd
 /// 但理由换成一个站得住的 ✓：**参考就是这么排的** ✓，而"跟着参考"本身可复核 ✓；
 /// 至于它**为什么**更对 ✓，在真测到之前**不写进注释** ✓（否则下一个人会把它当结论 ✓✗）。
 pub fn youtube_verdict(body: &str) -> Verdict {
-    if body.contains("www.google.cn") {
-        return Verdict { status: Status::Cn, region: Some("CN".into()) };
-    }
+    // ⚠️⚠️ 这里**从前有一条**"正文含 `www.google.cn` ⇒ 中国版" ✗✗ —— **删掉了** ✓：
+    // 那是**误报的来源** ✓（用户生产上就撞到过 ✓：正文里 0 次，面板却报「中国区」✗）。
+    // ⭐ 中国版现在**只由最终主机判定** ✓ ⇒ 见 [`youtube_is_cn_final`] ✓（调用方先判它 ✓）。
     if body.contains("Premium is not available in your country") {
         return Verdict { status: Status::NoPrem, region: None };
     }
@@ -369,6 +371,34 @@ pub fn youtube_verdict(body: &str) -> Verdict {
         return Verdict { status: Status::Unlocked, region: youtube_region(body) };
     }
     Verdict { status: Status::Unknown, region: None }
+}
+
+/// 从一个 URL 里取**主机名** ✓（纯函数 ✓ 所以有测试 ✓）：去掉协议 ✓ 端口 ✓ 路径 ✓ 查询 ✓，
+/// 并且**转小写** ✓（主机名不区分大小写 ✓）。
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = host.split(':').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// ⭐⭐ **"中国版"的唯一凭据：我们最后落在了 `google.cn`** ✓✓ ——
+/// ⚠️⚠️ 从前它是**正文里有没有 `www.google.cn`** ✗✗，而那是个**误报的来源** ✓：
+/// Google 自己的页面 ✓ hreflang 链接 ✓ 缓存片段 ✓ 里都可能有那个字符串 ✓。
+/// ⭐ 实测（2026-10-13 ✓，用户在**生产那台 US 机器**上跑的 ✓）：
+/// 面板显示「**中国区**」✗，而那一页正文里 `www.google.cn` 出现 **0 次** ✓✓；
+/// `ad-free` 在 **815,530** 字节处 ✓（说明那页其实是**正常解锁页** ✓）。
+/// ⇒ 所以判据必须建立在"**我们被跳到了哪里**"上 ✓ —— 那是**可复核的事实** ✓，
+/// 而不是"正文里恰好有某个串" ✓。
+/// ⚠️ 用 `== ` 与 `.google.cn` 后缀 ✓ —— 不能用 `contains("google.cn")` ✗
+///（`notgoogle.cn` ✓ `google.cn.evil.com` ✓ 都会命中 ✓✗）。
+pub fn youtube_is_cn_final(final_url: &str) -> bool {
+    host_of(final_url).is_some_and(|h| h == "google.cn" || h.ends_with(".google.cn"))
 }
 
 /// YouTube 的判据**到这儿就够了吗** ✓ —— 够了就别把整页读完 ✓✓（省内存 ✓ 也省时间 ✓）。
@@ -710,10 +740,16 @@ pub async fn run() -> Option<serde_json::Value> {
 
     // YouTube ✓：要带那两个头 ✓（否则页面上那几个字符串对不上 ✓✗）。
     // ⚠️ 走**带上限与停手条件**的那条路 ✓（它的标记在 813 KB 处 ✓，默认 512 KB 读不到 ✓）。
-    if let Ok(body) =
-        fetch_with_capped(YOUTUBE_URL, YOUTUBE_HEADERS, YOUTUBE_MAX_BYTES, &youtube_decided).await
+    if let Ok(page) =
+        fetch_page_capped(YOUTUBE_URL, YOUTUBE_HEADERS, YOUTUBE_MAX_BYTES, &youtube_decided).await
     {
-        merge(&mut out, verdict_json("youtube", &youtube_verdict(&body)));
+        // ⭐ **先判"我们最后落在哪"** ✓✓ —— 中国版只可能由它得出 ✓（正文不再参与这一档 ✓）。
+        let v = if youtube_is_cn_final(&page.final_url) {
+            Verdict { status: Status::Cn, region: Some("CN".into()) }
+        } else {
+            youtube_verdict(&page.body)
+        };
+        merge(&mut out, verdict_json("youtube", &v));
     }
 
     if out.is_empty() {
@@ -769,12 +805,23 @@ pub async fn fetch_status(url: &str, extra_header: &str) -> anyhow::Result<(u16,
 /// 只给 YouTube 用 ✓（它的标记在 813 KB 处 ✓，全局上限读不到 ✓）。
 /// ⚠️ 那个 trait object 必须 **`Send + Sync`** ✗：`run()` 的 future 要被 `tokio::spawn` ✓，
 /// 不带上它编译就过不去 ✓（我第一版正是漏了这两个 ✓，编译器当场拦下 ✓）。
-pub async fn fetch_status_capped(
+/// 一次取页的结果 ✓✓ —— ⚠️ **最终地址**必须一起带出来 ✗：
+/// 有些判据的凭据**不是正文，而是"我们最后落在哪个主机"** ✓✓（YouTube 的"中国版"就是 ✓）。
+/// ⚠️ 从前这里只有状态码与正文 ✓ ⇒ 调用方**看不出**自己是不是被跳走了 ✓✗ ——
+/// 于是只能去正文里找痕迹 ✓（`www.google.cn` ✓），而那是个**误报的来源** ✗
+/// （Google 自己的页面 / hreflang 链接 / 缓存片段里都有它 ✓）。
+pub struct Page {
+    pub status: u16,
+    pub body: String,
+    pub final_url: String,
+}
+
+pub async fn fetch_page_capped(
     url: &str,
     extra_header: &str,
     cap: usize,
     done: &(dyn Fn(&str) -> bool + Send + Sync),
-) -> anyhow::Result<(u16, String)> {
+) -> anyhow::Result<Page> {
     const MAX_REDIRECTS: u8 = 3;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -791,13 +838,24 @@ pub async fn fetch_status_capped(
                     None => anyhow::bail!("refusing a non-https redirect from {current}: {loc}"),
                 },
                 // 跳转但没给目标 ⇒ 就当这是最终响应 ✓（状态码本身仍是信息 ✓）
-                None => return Ok((status, body)),
+                None => return Ok(Page { status, body, final_url: current }),
             }
             continue;
         }
-        return Ok((status, body));
+        return Ok(Page { status, body, final_url: current });
     }
     anyhow::bail!("too many redirects starting at {url}")
+}
+
+/// 同 [`fetch_page_capped`] ✓，但只交出**状态码与正文** ✓（多数调用者只要这两样 ✓）。
+pub async fn fetch_status_capped(
+    url: &str,
+    extra_header: &str,
+    cap: usize,
+    done: &(dyn Fn(&str) -> bool + Send + Sync),
+) -> anyhow::Result<(u16, String)> {
+    let p = fetch_page_capped(url, extra_header, cap, done).await?;
+    Ok((p.status, p.body))
 }
 
 pub async fn fetch_with(url: &str, extra_header: &str) -> anyhow::Result<String> {
@@ -1483,19 +1541,41 @@ mod tests {
         assert_eq!(amazonpv_region(r#""currentTerritory":"""#), None, "空不算 ✓");
         assert_eq!(amazonpv_region("nothing"), None, "没有就别说 ✓");
     }
-    /// ⭐⭐ **顺序**是这一块最容易错的地方 ✗✗：中国版的页面里**也可能**出现 `ad-free` 字样 ✓
-    /// ⇒ 若先看 `ad-free` ✓，中国那一档就会被判成"解锁" ✓✗（一个**看起来很合理**的错值 ✓）。
+    /// ⚠️⚠️ **"中国版"不再看正文** ✗✓ —— 它只由**我们最后落在哪个主机**判定 ✓
+    /// （[`youtube_is_cn_final`] ✓）。
+    /// ⭐ 旧写法是"正文里含 `www.google.cn` ⇒ 中国版" ✗，而那是**误报的来源** ✓：
+    /// 用户在**生产那台 US 机器**上实测过 ✓ —— 面板报「中国区」✗，而那一页正文里它出现 **0 次** ✓
+    /// （`ad-free` 在 815,530 字节处 ✓ ⇒ 那其实是一页**正常解锁页** ✓）。
     #[test]
-    fn youtube_checks_the_china_domain_before_ad_free() {
+    fn youtube_china_is_decided_by_the_final_host_not_by_the_body() {
+        // ⚠️ 正文里有那个串 ⇒ **不再**算中国版 ✓（它就是误报的来源 ✓）
         let both = "<html>www.google.cn … ad-free …</html>";
         assert_eq!(
             youtube_verdict(both).status,
-            Status::Cn,
-            "两者都有时必须判中国版 ✓ —— 先看 ad-free 会误判成解锁 ✓✗"
+            Status::Unlocked,
+            "正文里有那个串不作数 ✓ —— 有 ad-free 就是解锁 ✓"
         );
-        // 而"买不到会员"也要**排在** ad-free 前面 ✓：那一页里同样可能有 ad-free 字样 ✓
+        // ⭐ 真正的凭据是"最后落在了 google.cn" ✓
+        assert!(youtube_is_cn_final("https://www.google.cn/premium"));
+        assert!(youtube_is_cn_final("https://google.cn/"));
+        assert!(!youtube_is_cn_final("https://www.youtube.com/premium"));
+        // ⚠️ 后缀判断**不能**写成 `contains` ✗：这两个都不是 google.cn ✓
+        assert!(!youtube_is_cn_final("https://notgoogle.cn/x"), "`notgoogle.cn` 不是它 ✓");
+        assert!(!youtube_is_cn_final("https://google.cn.evil.example/x"), "后缀必须真的到头 ✓");
+        // 而"买不到会员"照旧**排在** ad-free 前面 ✓：那一页里同样可能有 ad-free 字样 ✓
         let noprem = "<html>ad-free Premium is not available in your country</html>";
         assert_eq!(youtube_verdict(noprem).status, Status::NoPrem);
+    }
+
+    /// 主机解析 ✓（协议 ✓ 端口 ✓ 大小写 ✓ 用户信息 ✓ —— 无聊且可预测 ✓ 正是它该有的样子 ✓）。
+    #[test]
+    fn host_parsing_is_boring_and_predictable() {
+        assert_eq!(host_of("https://www.google.cn/x?y#z").as_deref(), Some("www.google.cn"));
+        assert_eq!(host_of("https://EXAMPLE.com:8443/a").as_deref(), Some("example.com"));
+        assert_eq!(host_of("https://u:p@example.com/a").as_deref(), Some("example.com"));
+        assert_eq!(host_of("https://example.com").as_deref(), Some("example.com"));
+        assert_eq!(host_of(""), None);
+        assert_eq!(host_of("https://"), None);
     }
 
     /// YouTube 的四档 ✓ + ⚠️ **"有 ad-free 但取不到地区"仍然算解锁** ✓✓
