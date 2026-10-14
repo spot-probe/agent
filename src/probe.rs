@@ -32,6 +32,10 @@ pub enum Status {
     Cn,
     /// **能用，但 Premium 会员买不到** ✓✓（第八档 ✓）：
     /// 视频能看 ✓，只是这个国家不卖会员 ✓ —— ⚠️ 它**能用** ✗，别当成"没解锁" ✓✗。
+    /// **解锁、但只有自制剧能看** ✓✓（第九档 ✓）：
+    /// Netflix 两页**都**说看不了 ⇒ 参考实现判 `NF.Only` ✓（那一档**能用** ✗ ——
+    /// 只是自制剧之外的内容看不了 ✓）⇒ ⚠️ **不是** `Blocked` ✗（判成红的会让人以为整台被墙 ✓✗）。
+    Org,
     NoPrem,
     /// **解锁、但对方把这个地址识别成机房** ✓✓（用户定的第四档 ✓）。
     /// ⚠️ 它与 `Unlocked` **不是一回事** ✗：机房 IP 在很多服务上吃亏 ✓，
@@ -65,9 +69,11 @@ pub fn netflix_verdict(page_a: &str, page_b: &str) -> Verdict {
     if !looks_like_a_real_page(page_a) || !looks_like_a_real_page(page_b) {
         return Verdict { status: Status::Unknown, region: None };
     }
-    let blocked = page_a.contains("Oh no!") && page_b.contains("Oh no!");
-    let status = if blocked {
-        Status::Blocked
+    // ⚠️ 两页**都**说看不了 ⇒ 参考实现判 **`org`（NF.Only / 仅自制）** ✓✓ —— 不是 blocked ✗：
+    // 那一档**能用** ✓，只是自制剧之外看不了 ✓（用户那张参考图上写的就是「仅自制」✓）。
+    let both_say_no = page_a.contains("Oh no!") && page_b.contains("Oh no!");
+    let status = if both_say_no {
+        Status::Org
     } else if page_a.contains("Oh no!") || page_b.contains("Oh no!") {
         // ⚠️ **只有一个**页面说看不了 ⇒ 说不清 ✓（可能是那一部剧在这个区没有 ✓，
         // 也可能另一页没取到 ✓）⇒ 如实说"没读明白" ✓，**不猜** ✗。
@@ -287,6 +293,7 @@ pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
         Status::Web => "web",
         Status::App => "app",
         Status::Cn => "cn",
+        Status::Org => "org",
         Status::NoPrem => "noprem",
     };
     let mut item = serde_json::Map::new();
@@ -1102,10 +1109,10 @@ mod tests {
 
     /// 两个页面都说看不了 ⇒ **未解锁** ✓（这是"对方明确告诉你"的那种 ✓，是结论 ✓）。
     #[test]
-    fn both_pages_saying_no_means_blocked() {
+    fn both_pages_saying_no_means_originals_only() {
         let v = netflix_verdict(&page("<html>Oh no!</html>"), &page("<html>Oh no!</html>"));
-        assert_eq!(v.status, Status::Blocked);
-        assert_eq!(v.region, None, "未解锁时不给地区 ✓（那边没有地区可言 ✓）");
+        assert_eq!(v.status, Status::Org, "两页都说看不了 ⇒ 仅自制 ✓（能用 ✓，不是被墙 ✗）");
+        assert_eq!(v.region, None, "这两页夹具里没有地区标记 ⇒ 地区就是 None ✓");
     }
 
     /// ⭐ **只有一页说看不了 ⇒ 不能下"未解锁"的结论** ✓✓ —— 这一条是这一块最要紧的测试 ✓：
@@ -1359,11 +1366,11 @@ mod tests {
             serde_json::json!({"netflix": {"status": "unlocked", "region": "JP"}})
         );
         // 未解锁 ✓（两个页面都说看不了 ✓）—— 没有地区 ✓（那边没有地区可言 ✓）
-        assert_eq!(nf("Oh no!", "Oh no!"), serde_json::json!({"netflix": {"status": "blocked"}}));
+        assert_eq!(nf("Oh no!", "Oh no!"), serde_json::json!({"netflix": {"status": "org"}}));
         // 没读明白 ✓ —— **照样上报** ✓（"这次没读明白"本身是有用的信息 ✓）
         assert_eq!(nf("", ""), serde_json::json!({"netflix": {"status": "unknown"}}));
         // ⚠️ 逐字对照 ✓：把三个可能被写错的形式列出来，改错就红 ✓
-        for (i, want) in ["unlocked", "blocked", "unknown"].iter().enumerate() {
+        for (i, want) in ["unlocked", "org", "unknown"].iter().enumerate() {
             let got = match i {
                 0 => nf("ok", "ok")["netflix"]["status"].clone(),
                 1 => nf("Oh no!", "Oh no!")["netflix"]["status"].clone(),
