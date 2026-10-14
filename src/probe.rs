@@ -60,6 +60,11 @@ pub struct Verdict {
 pub fn netflix_verdict(page_a: &str, page_b: &str) -> Verdict {
     // `Oh no!` 是 Netflix"这个区看不了"页面上的原话 ✓（参考实现就 grep 它 ✓）。
     // 两个页面都要看 ✓：只看一个会在"恰好一个页面不可用"时误判 ✓。
+    // ⚠️⚠️ **两个页面都得先过地板** ✗✗ —— 否则两个机器人页（都不含 `Oh no!` ✓）
+    // 会一路走到最后那个 `else` ⇒ 判成「**解锁**」✓✗ —— 一个**绿色的**错值 ✓（比红的更坏 ✓）。
+    if !looks_like_a_real_page(page_a) || !looks_like_a_real_page(page_b) {
+        return Verdict { status: Status::Unknown, region: None };
+    }
     let blocked = page_a.contains("Oh no!") && page_b.contains("Oh no!");
     let status = if blocked {
         Status::Blocked
@@ -305,6 +310,29 @@ const MAX_BYTES: usize = 512 * 1024;
 /// ⇒ 判中国/禁会员时**几乎立刻收手** ✓，只有"解锁"那一档才真的要读到 ~820 KB ✓。
 const YOUTUBE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+/// ⚠️⚠️ **"看着就不像产品页"的响应，不许被读成结论** ✗✗ —— 这一条治的是一整类**安静的错值** ✓：
+/// 限流页 ✓ 机器人页 ✓ 网关错误页 ✓ **都是 200** ✓，正文很小 ✓，里面当然也没有我们要找的标记 ✓
+/// ⇒ 判据就会得出"**未解锁**"（甚至"解锁" ✓✗）—— ⭐ 一个**看起来很正常的错结论** ✓。
+/// ⚠️ 用户生产上就撞到过 ✓：面板显示 PrimeVideo「未解锁」✗，而同一台机器上参考实现读到的
+///        是「**解锁 [US]**」✓（我实测那台机器取到的是 200 + `currentTerritory` 4 次 ✓）。
+///
+/// ⚠️ 阈值 **8 KB** ✓ 是**实测选出来的** ✓（2026-10-13 ✓，三个出口）：
+///   · 真实页面：**506 KB / 620 KB / 634 KB / 944 KB** ✓（PrimeVideo / YouTube ✓）
+///   · 一次限流：**521 字节** ✓（正文只有 521 ✓）
+///   ⇒ 两边差**三个数量级** ✓，8 KB 落在中间、离两边都远 ✓。
+///
+/// ⚠️ 这是**启发式** ✗ —— 它做不到"认出每一个机器人页" ✓，它只做一件事 ✓：
+/// **明显不可能是产品页的东西，不许变成结论** ✓（宁可说"没读明白" ✓）。
+/// ⚠️ ⚠️ 它**只适用于 HTML 页面** ✗✗ —— 别拿它去量 JSON 接口 ✓
+///（ChatGPT 那个 `compliance/cookie_requirements` 正常就只回 **38 字节** ✓，
+///  拿页面尺度去量它会把**正常**判成异常 ✓✗）。
+const PAGE_FLOOR: usize = 8 * 1024;
+
+/// 这个响应**够不够格当产品页** ✓（见 [`PAGE_FLOOR`] ✓）。纯函数 ✓ 所以有测试 ✓。
+fn looks_like_a_real_page(body: &str) -> bool {
+    body.len() >= PAGE_FLOOR
+}
+
 // ─────────────────────── YouTube（四档；其中两档是"能用但有条件"）───────────────────────
 
 /// YouTube 要取的地址 ✓（照参考实现 ✓ —— 它带一串 cookie 与 `Accept-Language: en` ✓）。
@@ -397,6 +425,10 @@ pub const AMAZONPV_URL: &str = "https://www.primevideo.com";
 /// ⚠️ 而"取页失败"**不在这里** ✗：那是调用方的事 ✓（连不上 ⇒ **不报** ✓✗，
 /// 因为一次网络故障不是结论 ✓ —— 与 Netflix/TikTok 同一条规矩 ✓）。
 pub fn amazonpv_verdict(body: &str) -> Verdict {
+    // ⚠️⚠️ **先过那道地板** ✗✗ —— 不然一次限流就会变成"未解锁" ✓（用户撞到过 ✓）。
+    if !looks_like_a_real_page(body) {
+        return Verdict { status: Status::Unknown, region: None };
+    }
     match amazonpv_region(body) {
         Some(r) => Verdict { status: Status::Unlocked, region: Some(r) },
         None => Verdict { status: Status::Blocked, region: None },
@@ -463,6 +495,24 @@ pub fn chatgpt_verdict(api_body: &str, ios_body: &str, favicon_status: u16) -> V
     Verdict { status, region: None }
 }
 
+/// ⚠️⚠️ **两段响应的"取回结果"怎么变成结论** ✗✗ —— 纯函数 ✓ 所以有测试 ✓。
+///
+/// 旧写法是 `if let (Ok(api), Ok(ios))` ✗ ⇒ **只要有一边取不到，整条都不报** ✓✗
+/// ⇒ hub 那边整份覆盖 ⇒ 面板上**一片空白** ✓ —— 用户那张图上 ChatGPT 就是空的 ✓✓。
+/// ⭐ 而"有一边没读到"和"两边都没读到"**不是一回事** ✗：
+///   · **只有一边读到** ⇒ 说不出"解锁 / 仅网页 / 仅 App"里是哪一档 ✓ ⇒ **如实说"没读明白"** ✓；
+///   · **两边都没读到** ⇒ 那是**网络故障** ✓，不是结论 ⇒ **不报** ✓（与 Netflix/TikTok 同一条规矩 ✓）。
+///
+/// ⚠️ 为什么把 favicon 当**参数**而不是在里面 await ✗：这一条要是纯的 ✓ 才测得了 ✓
+///（判据能测，是这个仓最值钱的那条规矩 ✓）。
+fn chatgpt_from_results(api: Option<&str>, ios: Option<&str>, favicon_status: u16) -> Option<Verdict> {
+    match (api, ios) {
+        (Some(a), Some(b)) => Some(chatgpt_verdict(a, b, favicon_status)),
+        (Some(_), None) | (None, Some(_)) => Some(Verdict { status: Status::Unknown, region: None }),
+        (None, None) => None,
+    }
+}
+
 /// 从 Cloudflare 的 trace 里取地区 ✓（`loc=XX` ✓ —— 参考实现就是这么取的 ✓）。
 /// 形状检查照旧 ✓：**必须两位大写字母** ✓（`loc=` 后面可能还有别的东西 ✓✗）。
 pub fn chatgpt_region(trace: &str) -> Option<String> {
@@ -496,7 +546,12 @@ pub const REDDIT_URL: &str = "https://www.reddit.com/svc/shreddit/reddit-chat";
 /// 那会把 403 这个**明确的结论**变成"没连上" ✓✗。
 pub fn reddit_verdict(status: u16, body: &str) -> Verdict {
     match status {
-        200 => Verdict { status: Status::Unlocked, region: reddit_region(body) },
+        // ⚠️ 200 也要过地板 ✗：一个 200 的小页面**不是** Reddit 的页面 ✓
+        //（实测正常那页是 **306 KB** ✓），把它读成"解锁"就是同一类错值 ✓。
+        200 if looks_like_a_real_page(body) => {
+            Verdict { status: Status::Unlocked, region: reddit_region(body) }
+        }
+        // ⚠️ **403 那条语义一个字没动** ✓ —— 参考与我们都判"屏蔽" ✓，用户那张图上也一致 ✓。
         403 => Verdict { status: Status::Blocked, region: None },
         _ => Verdict { status: Status::Unknown, region: None },
     }
@@ -564,7 +619,11 @@ pub fn tiktok_verdict(main: &str, second: &str) -> Verdict {
     if let Some(r) = tiktok_region(second) {
         return Verdict { status: Status::Idc, region: Some(r) };
     }
-    Verdict { status: Status::Blocked, region: None }
+    // ⚠️⚠️ 兜底**不是** `blocked` ✗ —— 参考实现这一档是 **Failed（失败）** ✓，
+    // 而它唯一给 `Block` 的分支是**死代码** ✓（`curl` 的错误走 stderr ✓，`$( )` 抓不到 ✓，
+    // 审计里已逐行复核 ✓）⇒ ⭐ **TikTok 不该有"被墙"这一档** ✓。
+    // 旧写法把"我什么都没读到"说成了"这个区不行" ✓✗ —— 与 AmazonPV 同一个毛病 ✓。
+    Verdict { status: Status::Unknown, region: None }
 }
 
 /// TikTok 那两个要取的自制剧页面 ✓（判据用的是它们 ✓ —— 见 [`netflix_verdict`] ✓）。
@@ -624,12 +683,22 @@ pub async fn run() -> Option<serde_json::Value> {
     // ChatGPT ✓：两段响应的**内容** + favicon 的**状态码**（二次确认 ✓），
     // 地区来自**另一次**请求（trace ✓）—— ⚠️ 它取不到**不影响**"能不能用"这个结论 ✓✓。
     let (api, ios) = tokio::join!(fetch(CHATGPT_API), fetch(CHATGPT_IOS));
-    if let (Ok(api), Ok(ios)) = (api, ios) {
+    let (api, ios) = (api.ok(), ios.ok());
+    // ⚠️ favicon 与 trace 只在**两边都读到**时才有意义 ✓（favicon 是那次判定的二次确认 ✓）；
+    // 只有一边读到的话结论本来就是"没读明白" ✓ ⇒ 不必再花两次请求 ✓。
+    let both = api.is_some() && ios.is_some();
+    let favicon = if both {
         // favicon 只**看状态码** ✓ ⇒ 用 `fetch_status` ✓（非 200 是它的正常取值之一 ✓，不是失败 ✓）
-        let favicon = fetch_status(CHATGPT_FAVICON, "").await.map(|(s, _)| s).unwrap_or(0);
-        let mut v = chatgpt_verdict(&api, &ios, favicon);
-        if let Ok(trace) = fetch(CHATGPT_TRACE).await {
-            v.region = chatgpt_region(&trace);
+        fetch_status(CHATGPT_FAVICON, "").await.map(|(s, _)| s).unwrap_or(0)
+    } else {
+        0
+    };
+    if let Some(mut v) = chatgpt_from_results(api.as_deref(), ios.as_deref(), favicon) {
+        // 地区来自**另一次**请求（trace ✓）—— ⚠️ 它取不到**不影响**"能不能用"这个结论 ✓✓。
+        if both {
+            if let Ok(trace) = fetch(CHATGPT_TRACE).await {
+                v.region = chatgpt_region(&trace);
+            }
         }
         merge(&mut out, verdict_json("chatgpt", &v));
     }
@@ -968,7 +1037,7 @@ mod tests {
     /// 它就只剩测试在用了 ✓✗ ⇒ 那个包装已删除 ✓：留着会让"测试测的路"与"线上跑的路"
     /// **不是同一条** ✓（很隐蔽的一种脱节 ✓）。
     fn nf(a: &str, b: &str) -> serde_json::Value {
-        verdict_json("netflix", &netflix_verdict(a, b))
+        verdict_json("netflix", &netflix_verdict(&page(a), &page(b)))
     }
 
     use super::*;
@@ -976,7 +1045,7 @@ mod tests {
     /// 两个页面都说看不了 ⇒ **未解锁** ✓（这是"对方明确告诉你"的那种 ✓，是结论 ✓）。
     #[test]
     fn both_pages_saying_no_means_blocked() {
-        let v = netflix_verdict("<html>Oh no!</html>", "<html>Oh no!</html>");
+        let v = netflix_verdict(&page("<html>Oh no!</html>"), &page("<html>Oh no!</html>"));
         assert_eq!(v.status, Status::Blocked);
         assert_eq!(v.region, None, "未解锁时不给地区 ✓（那边没有地区可言 ✓）");
     }
@@ -985,7 +1054,10 @@ mod tests {
     /// 它挡住的是"把一部剧在某区没有，说成整个 Netflix 被墙" ✓✗。
     #[test]
     fn one_page_saying_no_is_not_enough_to_call_it_blocked() {
-        let v = netflix_verdict("{\"id\":\"US\",\"countryName\":\"United States\"}", "<html>Oh no!</html>");
+        let v = netflix_verdict(
+            &page("{\"id\":\"US\",\"countryName\":\"United States\"}"),
+            &page("<html>Oh no!</html>"),
+        );
         assert_eq!(v.status, Status::Unknown, "只有一页 ⇒ 没读明白 ✓，不是未解锁 ✗");
         assert_eq!(v.region.as_deref(), Some("US"), "但读到的地区照样给出来 ✓");
     }
@@ -993,9 +1065,9 @@ mod tests {
     /// 两页都正常 ⇒ **解锁** ✓，并取到地区 ✓。
     #[test]
     fn two_good_pages_mean_unlocked_with_a_region() {
-        let a = "{\"id\":\"JP\",\"countryName\":\"Japan\"}";
-        let b = "{\"id\":\"JP\",\"countryName\":\"Japan\"}";
-        assert_eq!(netflix_verdict(a, b), Verdict { status: Status::Unlocked, region: Some("JP".into()) });
+        let a = page("{\"id\":\"JP\",\"countryName\":\"Japan\"}");
+        let b = page("{\"id\":\"JP\",\"countryName\":\"Japan\"}");
+        assert_eq!(netflix_verdict(&a, &b), Verdict { status: Status::Unlocked, region: Some("JP".into()) });
     }
 
     /// ⚠️ 地区必须**两位大写字母**才认 ✓ —— 否则页面上任何 `"id":"…"`（剧集 id ✓、
@@ -1257,23 +1329,23 @@ mod tests {
     /// ⭐ TikTok 那**三档** ✓✓ —— 第二档（机房 ✓）是最容易漏掉的 ✗：
     /// 参考实现里它是"主站没给、**第二次**给了" ✓ —— 漏掉它就会把机房机器显示成普通解锁 ✓✗。
     #[test]
-    fn tiktok_verdict_keeps_the_three_tiers_apart() {
-        let main = "{\"region\":\"JP\"}";
-        let second = "{\"region\":\"US\"}";
+    fn tiktok_keeps_unlocked_and_idc_apart() {
+        let main = page("{\"region\":\"JP\"}");
+        let second = page("{\"region\":\"US\"}");
         // ① 主站给了 ⇒ **解锁** ✓（地区取主站那个 ✓）
         assert_eq!(
-            tiktok_verdict(main, second),
+            tiktok_verdict(&main, &second),
             Verdict { status: Status::Unlocked, region: Some("JP".into()) }
         );
         // ② 主站没给、第二次给了 ⇒ **机房** ✓✓（不是"解锁" ✗，也不是"未解锁" ✗）
         assert_eq!(
-            tiktok_verdict("<html>nothing</html>", second),
+            tiktok_verdict(&page("<html>nothing</html>"), &second),
             Verdict { status: Status::Idc, region: Some("US".into()) }
         );
-        // ③ 两次都没有 ⇒ **未解锁** ✓
+        // ③ 两次都没有 ⇒ **没读明白** ✓（⚠️ TikTok **没有"被墙"这一档** ✗ —— 参考的兜底是 Failed ✓）
         assert_eq!(
-            tiktok_verdict("<html>nope</html>", "<html>nope</html>"),
-            Verdict { status: Status::Blocked, region: None }
+            tiktok_verdict(&page("<html>nope</html>"), &page("<html>nope</html>")),
+            Verdict { status: Status::Unknown, region: None }
         );
     }
 
@@ -1289,7 +1361,7 @@ mod tests {
             "拦截 ⇒ 没读到 ✓，**不是**未解锁 ✗"
         );
         // 而"真的没有地区、也没有拦截标记" ⇒ 那才是未解锁 ✓
-        assert_eq!(tiktok_verdict("<html>x</html>", "<html>y</html>").status, Status::Blocked);
+        assert_eq!(tiktok_verdict("<html>x</html>", "<html>y</html>").status, Status::Unknown);
     }
 
     /// 地区必须**两位大写字母** ✓（与 Netflix 那条同一条规矩 ✓）——
@@ -1320,7 +1392,7 @@ mod tests {
     fn reddit_reads_the_status_code_as_the_verdict() {
         // 200 ⇒ 解锁 ✓，地区从 body 取 ✓
         assert_eq!(
-            reddit_verdict(200, "… country=\"JP\" …"),
+            reddit_verdict(200, &page("… country=\"JP\" …")),
             Verdict { status: Status::Unlocked, region: Some("JP".into()) }
         );
         // 403 ⇒ **未解锁** ✓✓（不是 Unknown ✗）
@@ -1336,12 +1408,12 @@ mod tests {
     #[test]
     fn reddit_unlocked_survives_a_missing_or_odd_region() {
         assert_eq!(
-            reddit_verdict(200, "<html>no country here</html>"),
+            reddit_verdict(200, &page("<html>no country here</html>")),
             Verdict { status: Status::Unlocked, region: None }
         );
         for bad in ["country=\"jp\"", "country=\"JPN\"", "country=\"\""] {
             assert_eq!(
-                reddit_verdict(200, bad),
+                reddit_verdict(200, &page(bad)),
                 Verdict { status: Status::Unlocked, region: None },
                 "{bad:?} 不该被当成地区 ✓，但状态仍是解锁 ✓"
             );
@@ -1391,12 +1463,12 @@ mod tests {
     #[test]
     fn amazonpv_reads_the_territory_field() {
         assert_eq!(
-            amazonpv_verdict(r#"…"currentTerritory": "JP"…"#),
+            amazonpv_verdict(&page(r#"…"currentTerritory": "JP"…"#)),
             Verdict { status: Status::Unlocked, region: Some("JP".into()) }
         );
         // 页面取到了、但**没有**那个字段 ⇒ 未解锁 ✓（页面正常返回就是"对方给了答案" ✓）
         assert_eq!(
-            amazonpv_verdict("<html>no territory here</html>"),
+            amazonpv_verdict(&page("<html>no territory here</html>")),
             Verdict { status: Status::Blocked, region: None }
         );
     }
@@ -1558,5 +1630,63 @@ mod tests {
         assert_eq!(resolve_location(cur, "ftp://a.example/b"), None);
         assert_eq!(resolve_location(cur, ""), None);
         assert_eq!(resolve_location("http://a.example", "/x"), None, "起点就不是 https ⇒ 拒绝 ✓");
+    }
+
+    /// ⚠️⚠️ **一个"不像产品页"的响应，永远不许变成结论** ✗✗ —— 这一整类的回归闸 ✓。
+    /// 实测依据 ✓（2026-10-13）：真实页面 506–944 KB ✓，一次限流只有 **521 字节** ✓。
+    #[test]
+    fn a_response_too_small_to_be_the_product_is_never_a_verdict() {
+        // ⚠️ 那个"限流页"的样子 ✓ —— 它里面当然不会有我们要找的标记 ✓
+        let tiny = "<html><head><title>503</title></head><body>Sorry, something went wrong.</body></html>";
+        assert!(tiny.len() < PAGE_FLOOR, "这条测试的前提：它确实在地板以下 ✓");
+        assert_eq!(amazonpv_verdict(tiny).status, Status::Unknown, "AmazonPV：不许说未解锁 ✓");
+        // ⚠️ Netflix 这条更值钱 ✓：两个小页面以前会一路走到 else ⇒ 判「**解锁**」✓✗（绿错值 ✓）
+        assert_eq!(netflix_verdict(tiny, tiny).status, Status::Unknown, "Netflix：更不许说解锁 ✓");
+        assert_eq!(reddit_verdict(200, tiny).status, Status::Unknown, "Reddit：200 的小页不是页面 ✓");
+        // ⚠️ 而**够大**的页面照旧按原来的判据走 ✓（别把正常情形也拦了 ✓）
+        let big = "x".repeat(PAGE_FLOOR + 1);
+        assert_eq!(amazonpv_verdict(&big).status, Status::Blocked, "够大但没有那个键 ⇒ 仍是未解锁 ✓");
+        assert_eq!(netflix_verdict(&big, &big).status, Status::Unlocked, "够大、没有 Oh no! ⇒ 仍是解锁 ✓");
+    }
+
+    /// ⚠️ **TikTok 没有"被墙"这一档** ✗ —— 参考的兜底是 Failed（失败）✓，
+    /// 它唯一给 Block 的分支是死代码 ✓（审计逐行复核过 ✓）。
+    #[test]
+    fn tiktok_falls_back_to_unknown_not_blocked() {
+        let blocked_looking = "<html>".to_string() + &"y".repeat(PAGE_FLOOR) + "</html>";
+        assert_eq!(tiktok_verdict(&blocked_looking, "").status, Status::Unknown);
+        assert_eq!(tiktok_verdict("", "").status, Status::Unknown);
+    }
+
+    /// ⚠️ "有一边没读到"要说出来 ✓；"两边都没读到"才不报 ✓（网络故障不是结论 ✓）。
+    #[test]
+    fn chatgpt_says_unknown_when_only_one_side_could_be_read() {
+        let api = r#"{"unsupported_country": true}"#;
+        let ios = "<html>VPN</html>";
+        // 两边都读到 ⇒ 照原判据 ✓（API 有问题 + favicon 403 ⇒ 未解锁 ✓）
+        assert_eq!(chatgpt_from_results(Some(api), Some(ios), 403).map(|v| v.status), Some(Status::Blocked));
+        // ⚠️ 只有一边 ⇒ **没读明白**（不是沉默 ✗，也不是猜 ✓）
+        assert_eq!(chatgpt_from_results(Some(api), None, 0).map(|v| v.status), Some(Status::Unknown));
+        assert_eq!(chatgpt_from_results(None, Some(ios), 0).map(|v| v.status), Some(Status::Unknown));
+        // 两边都没读到 ⇒ **什么都不报** ✓
+        assert!(chatgpt_from_results(None, None, 0).is_none());
+    }
+
+    /// ⚠️ **夹具要够大** ✗✓ —— 判据现在先过一道"这像不像产品页"的地板 ✓（[`PAGE_FLOOR`] ✓），
+    /// 而这里过去写的都是 `"<html>…</html>"` 这种小串 ✓ ⇒ 它们会被**正确地**判成"没读明白" ✓。
+    /// ⇒ 这个助手把夹具补到**页面尺度** ✓，让那些测试继续测**判据本身** ✓（而不是在测地板 ✓）。
+    /// ⚠️ 填充用的是 `=` ✓ —— 不会碰巧带上任何判据要找的标记 ✓。
+    fn page(s: &str) -> String {
+        // ⚠️⚠️ **空串不补** ✗✓ —— "正文是空的"是一个**独立的情形** ✓（判据里它自己有一支 ✓，
+        // 说的是"这次什么都没读到" ⇒ `unknown` ✓）。补成页面尺度会把它变成"两个正常页面" ✓✗
+        // ⇒ 判成**解锁** ✓ —— ⭐ 这一条是那条测试当场抓住的 ✓（我先写的版本正是这么错的 ✓）。
+        if s.trim().is_empty() {
+            return s.to_string();
+        }
+        let mut out = String::from(s);
+        if out.len() < PAGE_FLOOR + 1 {
+            out.push_str(&"=".repeat(PAGE_FLOOR + 1 - out.len()));
+        }
+        out
     }
 }
