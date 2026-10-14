@@ -501,6 +501,29 @@ pub fn amazonpv_region(body: &str) -> Option<String> {
 pub const CHATGPT_API: &str = "https://api.openai.com/compliance/cookie_requirements";
 pub const CHATGPT_IOS: &str = "https://ios.chat.openai.com/";
 pub const CHATGPT_FAVICON: &str = "https://chatgpt.com/favicon.ico";
+
+/// ⭐ **favicon 那次请求要带的那套头** ✓✓ —— 照参考实现**逐行抄** ✓（它是 `curl -H '…'` 一整组 ✓）：
+/// `accept`（图片那串 ✓）· `accept-language` ✓ · **`authorization: Bearer null`** ✓ ·
+/// `content-type` ✓ · `origin`/`referer` ✓ · `sec-ch-ua*` ✓ · `sec-fetch-*` ✓ · **Edge 的 UA** ✓。
+/// ⚠️ 为什么值得抄 ✓：favicon 的 **403** 是"API 那边不支持这个国家"的**第二重确认** ✓✗
+///（`chatgpt_verdict` 里那个 `&& favicon_status == 403` ✓）——
+/// 而我们此前**一个头都没带** ✗ ⇒ Cloudflare 多半直接给别的码 ✓ ⇒ 那两档**结构性地到不了** ✓✗。
+/// ⚠️ 两处**刻意不抄** ✗：① 参考里还有一个 `authority:` ✓ —— 那是 HTTP/2 的伪头 ✓，
+/// 在 HTTP/1.1 里没有意义 ✓（我们自己的 `Host:` 是对的 ✓）；
+/// ② 参考里 `accept` 出现了**两次** ✓（图片那串 + `*/*` ✓）—— 只抄前一个 ✓（够用 ✓ 且少一个头 ✓）。
+pub const CHATGPT_FAVICON_HEADERS: &str = "accept: image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8\r\n\
+accept-language: zh-CN,zh;q=0.9\r\n\
+authorization: Bearer null\r\n\
+content-type: application/json\r\n\
+origin: https://chatgpt.com\r\n\
+referer: https://chatgpt.com/\r\n\
+sec-ch-ua: \"Microsoft Edge\";v=\"119\", \"Chromium\";v=\"119\", \"Not?A_Brand\";v=\"24\"\r\n\
+sec-ch-ua-mobile: ?0\r\n\
+sec-ch-ua-platform: \"Windows\"\r\n\
+sec-fetch-dest: empty\r\n\
+sec-fetch-mode: cors\r\n\
+sec-fetch-site: same-site\r\n\
+user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0";
 pub const CHATGPT_TRACE: &str = "https://chat.openai.com/cdn-cgi/trace";
 
 /// ChatGPT 的判据 ✓✓ —— 纯函数 ✓，输入是**两段响应 + favicon 的状态码** ✓。
@@ -741,7 +764,7 @@ pub async fn run() -> Option<serde_json::Value> {
     let both = api.is_some() && ios.is_some();
     let favicon = if both {
         // favicon 只**看状态码** ✓ ⇒ 用 `fetch_status` ✓（非 200 是它的正常取值之一 ✓，不是失败 ✓）
-        fetch_status(CHATGPT_FAVICON, "").await.map(|(s, _)| s).unwrap_or(0)
+        fetch_status(CHATGPT_FAVICON, CHATGPT_FAVICON_HEADERS).await.map(|(s, _)| s).unwrap_or(0)
     } else {
         0
     };
@@ -902,6 +925,35 @@ pub async fn fetch_with_capped(
 
 /// 发一次请求并读回（**最多** `MAX_BYTES` ✓）。返回 `(状态码, 头部结束位置, 全文)`。
 /// ⚠️ 与 `fetch` 拆开只是为了让上面那段跳转逻辑**读起来是一件事** ✓。
+/// 造一条 HTTP/1.1 请求 ✓✓（纯函数 ✓ —— 所以"发了几个 `Accept`"这种事**测得了** ✓）。
+///
+/// ⚠️⚠️ **`User-Agent` 与 `Accept` 默认给，但能被 extra 覆盖** ✗✗ ——
+/// 从前那两行是**硬写**的 ✓，而 extra 是**追加**上去的 ✓✗ ⇒ 只要 extra 里也有一个 `Accept`
+/// ✓，发出去就是**两个** ✓（参考实现给的是 `-H "Accept: …"` ✓，那会**替换** curl 的默认头 ✓；
+/// 我们却是叠加 ✓）。用户要的 TikTok 那一次正是这种情形 ✓。
+/// ⚠️ `Host` **不许被覆盖** ✗：它必须与我们要连的主机一致 ✓（extra 里的 `authority:` 是 HTTP/2
+/// 的伪头 ✓，在 HTTP/1.1 里没有意义 ✓ ⇒ 忽略它 ✓）。
+fn build_request(path: &str, authority: &str, extra_header: &str) -> String {
+    let extra = extra_header.trim();
+    // 这两行由本函数自己写 ⇒ extra 里的一律丢掉，否则会发出两份。
+    // 是那条测试抓住的（它先报 UA 数不对，接着报 Host 被夹带）。
+    let extra: String = extra
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            let low = l.to_ascii_lowercase();
+            !l.is_empty() && !low.starts_with("host:") && !low.starts_with("connection:")
+        })
+        .map(|l| format!("{l}\r\n"))
+        .collect();
+    let has =
+        |name: &str| extra.lines().any(|l| l.trim().to_ascii_lowercase().starts_with(&format!("{name}:")));
+    let ua = if has("user-agent") { "" } else { "User-Agent: monitor-agent\r\n" };
+    let accept = if has("accept") { "" } else { "Accept: */*\r\n" };
+    let extra_line = extra.as_str();
+    format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\n{ua}{accept}{extra_line}Connection: close\r\n\r\n")
+}
+
 async fn get_once(
     url: &str,
     extra_header: &str,
@@ -930,11 +982,7 @@ async fn get_once(
     let mut tls = connector.connect(name, tcp).await?;
     // ⚠️ 自定义头**只在给了的时候**才加 ✓ —— 空字符串不加，免得写出一个空头行 ✓✗
     //（空头行会被某些服务器当成请求结束 ✓，那会让"取页成功但没有内容" ✓✗ —— 安静的错 ✓）。
-    let extra =
-        if extra_header.trim().is_empty() { String::new() } else { format!("{}\r\n", extra_header.trim()) };
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: monitor-agent\r\nAccept: */*\r\n{extra}Connection: close\r\n\r\n"
-    );
+    let req = build_request(path, authority, extra_header);
     tls.write_all(req.as_bytes()).await?;
 
     let mut buf = Vec::new();
@@ -1803,5 +1851,42 @@ mod tests {
         );
         assert_eq!(tiktok_region(r#"{"region":"US"} {"region":""}"#), None, "最后一处不合法 ⇒ 取不到 ✓");
         assert_eq!(tiktok_region(r#"{"region":"us"}"#), None, "小写不算 ✓");
+    }
+
+    /// ⚠️⚠️ **extra 里的头要"替换"默认那份，不是叠加** ✗✗ ——
+    /// 用户要的 TikTok 那一次正是这种情形 ✓：参考给 `-H "Accept: …"`（替换 curl 默认头 ✓），
+    /// 而我们是硬写 `Accept: */*` 再**追加** ⇒ 实际发出去**两个** ✓✗。
+    #[test]
+    fn a_header_in_extra_replaces_the_default_instead_of_stacking() {
+        // extra 给了 Accept ⇒ 只能有一个 ✓，而且留下的必须是 extra 那个 ✓
+        let r = build_request("/premium", "www.tiktok.com", "Accept: text/html,application/xhtml+xml");
+        assert_eq!(r.matches("ccept:").count(), 1, "只能发一个 Accept ✓");
+        assert!(r.contains("Accept: text/html"), "留下的应当是 extra 那个 ✓");
+        assert!(!r.contains("Accept: */*"), "默认那份必须让位 ✓");
+        // 没给 ⇒ 默认那份照旧 ✓
+        let d = build_request("/x", "example.com", "");
+        assert_eq!(d.matches("ccept:").count(), 1);
+        assert!(d.contains("Accept: */*"));
+        // UA 同理 ✓（ChatGPT 的 favicon 那次要装成 Edge ✓）
+        let e = build_request("/favicon.ico", "chatgpt.com", "user-agent: Edge/119");
+        // ⚠️ 数的时候**要按小写数** ✗ —— HTTP 头名**不区分大小写** ✓（规范如此 ✓），
+        // 而 extra 那行是小写的 ✓ ⇒ 拿大写去数会数出 0 ✓✗ —— 我第一版就是这样把**测试**写错的 ✓
+        //（代码是对的 ✓；是断言糙了 ✓）。
+        assert_eq!(e.to_ascii_lowercase().matches("user-agent:").count(), 1, "只能发一个 UA ✓");
+        assert!(e.contains("user-agent: Edge/119"));
+        // ⚠️ `Host` **不许**被 extra 覆盖 ✗ —— 它必须与我们要连的主机一致 ✓
+        let h = build_request("/x", "example.com", "Host: evil.example");
+        assert!(h.contains("Host: example.com"));
+        assert!(!h.contains("evil.example"));
+        // HTTP 头不区分大小写 ✓ ⇒ 判断也要如此 ✓
+        // ⚠️⚠️ 数之前**先转小写** ✗ —— 我在这里**第二次**犯同一个错 ✓✗：
+        // 原串里是**大写** `ACCEPT:` ✓，而我拿小写 `ccept:` 去数 ⇒ 数出 0 ✓
+        //（⭐ 代码是对的 ✓ —— 它内部就是 `to_ascii_lowercase()` 判断的 ✓；
+        //  默认那份**已经被正确丢掉**了 ✓）。HTTP 头名不区分大小写 ✓ ⇒ 数法也要如此 ✓。
+        assert_eq!(
+            build_request("/x", "e.com", "ACCEPT: y").to_ascii_lowercase().matches("ccept:").count(),
+            1,
+            "大写给小写都得只发一个 ✓"
+        );
     }
 }
