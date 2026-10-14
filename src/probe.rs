@@ -297,6 +297,14 @@ pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
 /// ⚠️ 写在两处会漂移 ✓：改了一处、另一处还是旧值 ✓，而那种不一致**不报错** ✓✗。
 const MAX_BYTES: usize = 512 * 1024;
 
+/// ⚠️⚠️ **YouTube 单独的上限** ✗✗ —— 它的 `ad-free` 出现在**字节 813,352**（整页 941,197 ✓，
+/// 2026-10-13 实测 ✓），而上面的全局 `MAX_BYTES` 是 512 KB ⇒ **三个标记一个都读不到** ✓✗
+/// ⇒ 这个服务此前**永远判"没读明白"** ✓，而且**看不出来** ✓（面板上就是一个灰胶囊 ✓）。
+/// ⚠️ **不抬全局上限** ✗✗：那个 512 KB 是有理由的 ✓（整份读进内存出过 OOM 事故 ✓）——
+/// 这里只给**这一个**服务放开 ✓，并且配合 [`youtube_decided`] 的"够了就停" ✓
+/// ⇒ 判中国/禁会员时**几乎立刻收手** ✓，只有"解锁"那一档才真的要读到 ~820 KB ✓。
+const YOUTUBE_MAX_BYTES: usize = 2 * 1024 * 1024;
+
 // ─────────────────────── YouTube（四档；其中两档是"能用但有条件"）───────────────────────
 
 /// YouTube 要取的地址 ✓（照参考实现 ✓ —— 它带一串 cookie 与 `Accept-Language: en` ✓）。
@@ -317,8 +325,11 @@ pub const YOUTUBE_HEADERS: &str = "Accept-Language: en\r\nCookie: YSC=BiCUU3-5Gd
 ///    **不因为缺一格就改判** ✓，与 Netflix/Reddit 同一条规矩 ✓）；
 /// 5. 其它 ⇒ **不猜** ✓（`Unknown` ✓ —— 既不是"能用"也不是"不能用" ✓）。
 ///
-/// ⚠️ 1 与 2 必须**排在** 3 前面 ✗：中国版页面里也可能有 `ad-free` 字样 ✓，
-/// 先看 `ad-free` 就会把中国那一档判成"解锁" ✓✗（一个**看起来很合理**的错值 ✓）。
+/// ⚠️ **顺序与参考实现一字不差** ✓（cn ⇒ noprem ⇒ ad-free ⇒ else ✓）。
+/// ⚠️ 我原先在这里写的理由是"中国版页面里也可能出现 `ad-free`，所以顺序致命" ✗ ——
+/// **那条理由未经验证** ✗（`www.google.cn` 那条出口测不到 ✓）。顺序**照参考保留** ✓，
+/// 但理由换成一个站得住的 ✓：**参考就是这么排的** ✓，而"跟着参考"本身可复核 ✓；
+/// 至于它**为什么**更对 ✓，在真测到之前**不写进注释** ✓（否则下一个人会把它当结论 ✓✗）。
 pub fn youtube_verdict(body: &str) -> Verdict {
     if body.contains("www.google.cn") {
         return Verdict { status: Status::Cn, region: Some("CN".into()) };
@@ -332,21 +343,44 @@ pub fn youtube_verdict(body: &str) -> Verdict {
     Verdict { status: Status::Unknown, region: None }
 }
 
+/// YouTube 的判据**到这儿就够了吗** ✓ —— 够了就别把整页读完 ✓✓（省内存 ✓ 也省时间 ✓）。
+/// ⚠️ 三种标记**各自需要什么**不一样 ✗：
+///   · `www.google.cn` ⇒ 判中国 ✓，地区**硬写 CN** ✓ ⇒ 见到它就能停 ✓；
+///   · `Premium is not available in your country` ⇒ 判禁会员 ✓，**没有地区** ✓ ⇒ 见到就能停 ✓；
+///   · `ad-free` ⇒ 判解锁 ✓，但同一条判据**还要取地区** ✓ ⇒ 必须**连 `contentRegion` 一起**见到 ✓✗
+///     （停早了会把地区弄丢 ✓ —— 而"状态对、地区静默消失"正是本仓最怕的那类错 ✓）。
+pub fn youtube_decided(body: &str) -> bool {
+    body.contains("www.google.cn")
+        || body.contains("Premium is not available in your country")
+        || (body.contains("ad-free") && body.contains("\"contentRegion\""))
+}
+
 /// 从页面里取 `"contentRegion":"XX"` ✓ —— 形状检查照旧 ✓（两位大写 ✓）。
 pub fn youtube_region(body: &str) -> Option<String> {
-    let i = body.find("\"contentRegion\"")? + "\"contentRegion\"".len();
-    let rest = &body[i..];
-    let colon = rest.find(':')?;
-    let after_colon = &rest[colon + 1..];
-    let q = after_colon.find('"')?;
-    let after = &after_colon[q + 1..];
-    let end = after.find('"')?;
-    let code = &after[..end];
-    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
-        Some(code.to_string())
-    } else {
-        None
+    const KEY: &str = "\"contentRegion\"";
+    // ⚠️ 取**最后一处** ✓✓（参考的 `sed` 里 `.*` 是贪婪的 ⇒ 它取的也是最后一处 ✓）。
+    // 实测那页 13 处值全相同 ⇒ 这一条**当前无差别** ✓；但"先给值、后给空"的页面会分叉 ✓
+    // ⇒ 既然要对齐参考，就对齐到底 ✓。
+    // ⚠️ 形状检查**比参考严** ✓（只收两位大写 ✓；源码 `usa`／`USA` 照收 ✓）——
+    // 这是**刻意**的 ✓：hub 那一侧也是这个形状 ✓，宽收进来反而会在别处被丢 ✓。
+    let mut found: Option<String> = None;
+    let mut from = 0usize;
+    while let Some(i) = body[from..].find(KEY) {
+        let start = from + i + KEY.len();
+        from = start;
+        let Some(colon) = body[start..].find(':') else { continue };
+        let after_colon = &body[start + colon + 1..];
+        let Some(q) = after_colon.find('"') else { continue };
+        let after = &after_colon[q + 1..];
+        let Some(end) = after.find('"') else { continue };
+        let code = &after[..end];
+        found = if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+            Some(code.to_string())
+        } else {
+            None
+        };
     }
+    found
 }
 
 // ───────────────────────────── AmazonPV（最干净的一个：一页定生死）─────────────────────────────
@@ -606,7 +640,10 @@ pub async fn run() -> Option<serde_json::Value> {
     }
 
     // YouTube ✓：要带那两个头 ✓（否则页面上那几个字符串对不上 ✓✗）。
-    if let Ok(body) = fetch_with(YOUTUBE_URL, YOUTUBE_HEADERS).await {
+    // ⚠️ 走**带上限与停手条件**的那条路 ✓（它的标记在 813 KB 处 ✓，默认 512 KB 读不到 ✓）。
+    if let Ok(body) =
+        fetch_with_capped(YOUTUBE_URL, YOUTUBE_HEADERS, YOUTUBE_MAX_BYTES, &youtube_decided).await
+    {
         merge(&mut out, verdict_json("youtube", &youtube_verdict(&body)));
     }
 
@@ -655,13 +692,27 @@ pub async fn fetch(url: &str) -> anyhow::Result<String> {
 /// ⚠️ **跳转照样跟随** ✓（与 `fetch` 同一套 ✓）：不跟的话读到的是跳转页 ✓，
 /// 而它的内容看起来也像正常页面 ✓✗ ⇒ 状态码与正文都会被带偏 ✓。
 pub async fn fetch_status(url: &str, extra_header: &str) -> anyhow::Result<(u16, String)> {
+    // ⚠️ 默认**一字不变** ✓：全局上限 ✓、从不提前收手 ✓。
+    fetch_status_capped(url, extra_header, MAX_BYTES, &|_| false).await
+}
+
+/// 同 [`fetch_status`] ✓，但可以指定**这次最多读多少** ✓ 以及**什么时候算够了** ✓✓ ——
+/// 只给 YouTube 用 ✓（它的标记在 813 KB 处 ✓，全局上限读不到 ✓）。
+/// ⚠️ 那个 trait object 必须 **`Send + Sync`** ✗：`run()` 的 future 要被 `tokio::spawn` ✓，
+/// 不带上它编译就过不去 ✓（我第一版正是漏了这两个 ✓，编译器当场拦下 ✓）。
+pub async fn fetch_status_capped(
+    url: &str,
+    extra_header: &str,
+    cap: usize,
+    done: &(dyn Fn(&str) -> bool + Send + Sync),
+) -> anyhow::Result<(u16, String)> {
     const MAX_REDIRECTS: u8 = 3;
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let (status, headers_end, body) =
-            tokio::time::timeout(TIMEOUT, get_once(&current, extra_header)).await??;
+            tokio::time::timeout(TIMEOUT, get_once(&current, extra_header, cap, done)).await??;
         if (300..400).contains(&status) {
             match header(&body[..headers_end.min(body.len())], "location") {
                 Some(loc) if loc.starts_with("https://") => current = loc,
@@ -677,9 +728,19 @@ pub async fn fetch_status(url: &str, extra_header: &str) -> anyhow::Result<(u16,
 }
 
 pub async fn fetch_with(url: &str, extra_header: &str) -> anyhow::Result<String> {
+    fetch_with_capped(url, extra_header, MAX_BYTES, &|_| false).await
+}
+
+/// 同 [`fetch_with`] ✓，但可以指定**上限**与**停手条件** ✓ —— 见 [`fetch_status_capped`] ✓。
+pub async fn fetch_with_capped(
+    url: &str,
+    extra_header: &str,
+    cap: usize,
+    done: &(dyn Fn(&str) -> bool + Send + Sync),
+) -> anyhow::Result<String> {
     // ⚠️ 行为与从前**一字不变** ✓：非 200 一律算失败 ✓（Netflix 与 TikTok 的判据就是这样假设的 ✓）。
     // 需要看状态码的服务走 [`fetch_status`] ✓ —— 两条路各取所需 ✓，谁也不改变谁 ✓。
-    let (status, body) = fetch_status(url, extra_header).await?;
+    let (status, body) = fetch_status_capped(url, extra_header, cap, done).await?;
     if status != 200 {
         anyhow::bail!("{url} answered HTTP {status}");
     }
@@ -688,7 +749,12 @@ pub async fn fetch_with(url: &str, extra_header: &str) -> anyhow::Result<String>
 
 /// 发一次请求并读回（**最多** `MAX_BYTES` ✓）。返回 `(状态码, 头部结束位置, 全文)`。
 /// ⚠️ 与 `fetch` 拆开只是为了让上面那段跳转逻辑**读起来是一件事** ✓。
-async fn get_once(url: &str, extra_header: &str) -> anyhow::Result<(u16, usize, String)> {
+async fn get_once(
+    url: &str,
+    extra_header: &str,
+    cap: usize,
+    done: &(dyn Fn(&str) -> bool + Send + Sync),
+) -> anyhow::Result<(u16, usize, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let rest = url.strip_prefix("https://").ok_or_else(|| anyhow!("not https: {url}"))?;
@@ -720,20 +786,103 @@ async fn get_once(url: &str, extra_header: &str) -> anyhow::Result<(u16, usize, 
 
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut checked = 0usize;
     loop {
         let n = tls.read(&mut chunk).await?;
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.len() >= MAX_BYTES {
-            buf.truncate(MAX_BYTES);
+        // ⚠️ **先解 chunked、再判"够了没有"** ✗✓ —— 否则判据看到的是带分块框架的原始字节 ✓，
+        // 标记跨块边界时会被框架打断 ✓（那正是"状态照旧、地区静默消失"的来源 ✓）。
+        // ⚠️ 每 32 KB 才检查一次 ✓：每次检查都要把已有的正文重解一遍 ✓，
+        // 每读一小块就查一次会变成平方级 ✓（8 KB 一块 ⇒ 100 多次重解 ✓）。
+        if buf.len() - checked >= 32 * 1024 {
+            checked = buf.len();
+            if done(&assemble(&buf)) {
+                break;
+            }
+        }
+        if buf.len() >= cap {
+            buf.truncate(cap);
             break;
         }
     }
-    let text = String::from_utf8_lossy(&buf).into_owned();
+    let text = assemble(&buf);
     let (status, headers_end) = parse_status_and_headers(&text)?;
     Ok((status, headers_end, text))
+}
+
+/// 把**原始响应字节**变成"头部 + 正文"文本 ✓✓。
+/// ⚠️ 若对方用了 `Transfer-Encoding: chunked`，**这里把分块框架剥掉** ✗ ——
+/// 我们此前是**裸读** ✓ ⇒ 正文里会混着 `1a2b\r\n` 这类框架 ✓
+/// ⇒ **标记只要跨块边界就会断** ✓，而"状态照旧、地区静默消失"正是本仓最怕的那类错 ✓。
+///
+/// ⚠️⚠️ **但别把这条说成 YouTube 那个 bug 的原因** ✗✗ —— 我一度这么写过，是错的 ✓。
+/// 2026-10-13 我自己用代理实测（两次，一次 curl 默认头、一次 agent 自己那套头 ✓）：
+/// 那个响应**都没有** `transfer-encoding` ✓（是 Content-Length ✓）
+/// ⇒ 那一次**唯一的拦路虎就是 512 KB 上限** ✓✗。
+/// 保留剥框架 ✓ 是因为别的服务/别的时刻确实会分块 ✓（审计里 Reddit 那一条实测就是 ✓），
+/// 而不是因为它能治 YouTube 这一次 ✓ —— 写清楚，免得下一个人把因果搞反 ✓。
+/// ⚠️ 只动正文 ✓：头部原样保留 ✓（跳转、状态码都还要用 ✓）。
+fn assemble(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let Some(headers_end) = text.find("\r\n\r\n").map(|i| i + 4) else {
+        return text.into_owned();
+    };
+    let head = &text[..headers_end];
+    if !head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        return text.into_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push_str(head);
+    out.push_str(&dechunk(&text[headers_end..]));
+    out
+}
+
+/// 剥掉 HTTP/1.1 的分块框架 ✓（纯函数 ✓ —— 所以它有测试 ✓✓）。
+/// ⚠️ 三件必须处理的事 ✗：
+///   ① 块大小是**十六进制** ✓，而且**可以带 `;扩展`** ✓；
+///   ② 最后一块是 `0` ✓，其后是 trailer ✓ —— 见到就收手 ✓；
+///   ③ ⚠️ **截断**（我们读到一半就停 ✓）⇒ **把手上已经拿到的交出去** ✓✗，
+///      绝不因为"不完整"就整条丢掉 ✓（丢掉等于把读到的正文扔了 ✓）。
+/// ⚠️ 若**第一行就不是块大小** ⇒ **原样返回** ✓ —— 宁可不剥，也不吃掉正文 ✓。
+fn dechunk(body: &str) -> String {
+    // ⚠️ **先确认"第一行确实是块大小"** ✗✓ —— 不是（含"连行尾都没有"的截断）⇒ **原样返回** ✓。
+    // ⚠️ 我第一版漏了这一步 ✓✗：那种输入会一路 `break` 出去 ⇒ **返回空串** ✓
+    // ⇒ 正好违反"宁可不剥，也不吃掉正文"那条契约 ✓（写测试时才发现 ✓）。
+    let is_size_line =
+        |line: &str| usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16).is_ok();
+    match body.find("\r\n") {
+        Some(eol) if is_size_line(&body[..eol]) => {}
+        _ => return body.to_string(),
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    // ⚠️ 写成 `while let` ✓（clippy 那条 `never_loop`/`while_let_loop` 是对的 ✓：
+    // 循环体第一件事就是"找不到行尾就出去" ⇒ 那本来就是 while 的条件 ✓）。
+    while let Some(eol) = rest.find("\r\n") {
+        let size_txt = rest[..eol].split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_txt, 16) else {
+            return body.to_string();
+        };
+        rest = &rest[eol + 2..];
+        if size == 0 {
+            break;
+        }
+        if rest.len() < size {
+            out.push_str(rest);
+            break;
+        }
+        out.push_str(&rest[..size]);
+        rest = &rest[size..];
+        // 数据后面应当有一个 CRLF ✓；没有（截断）就到此为止 ✓
+        match rest.strip_prefix("\r\n") {
+            Some(next) => rest = next,
+            None => break,
+        }
+    }
+    out
 }
 
 /// 从响应里读状态码与"头部结束"的位置 ✓（纯函数 ✓ —— 所以它有测试 ✓✓）。
@@ -1250,5 +1399,77 @@ mod tests {
         assert_eq!(youtube_region(r#""contentRegion":"USA""#), None, "三位不算 ✓");
         assert_eq!(youtube_region(r#""contentRegion":"""#), None, "空不算 ✓");
         assert_eq!(youtube_region("nothing"), None, "没有就别说 ✓");
+    }
+
+    /// 造一个 chunked 正文 ✓（`parts` 是各块的数据 ✓ —— 框架由这里补 ✓）。
+    fn chunked(parts: &[&str]) -> String {
+        let mut out = String::new();
+        for p in parts {
+            out.push_str(&format!("{:x}\r\n{}\r\n", p.len(), p));
+        }
+        out.push_str("0\r\n\r\n");
+        out
+    }
+
+    /// ⚠️⚠️ **标记跨 chunk 边界** ✗✗ —— 这是"裸读会读错"的那一条 ✓：
+    /// 分块框架会**插在标记中间** ✓ ⇒ 判据看不到 `"contentRegion"` ✓
+    /// ⇒ **状态照旧、地区静默消失** ✓（本仓最怕的那类错 ✓）。
+    #[test]
+    fn a_marker_split_across_chunks_survives() {
+        let raw = chunked(&["<html>\"contentReg", "ion\":\"HK\" ad-free</html>"]);
+        assert_eq!(youtube_region(&raw), None, "⚠️ **裸读就是读不到** ✓（先把这条错钉住 ✓）");
+        let out = dechunk(&raw);
+        assert!(out.contains("\"contentRegion\":\"HK\""), "拼回去之后标记必须完整 ✓");
+        assert_eq!(youtube_region(&out).as_deref(), Some("HK"), "剥掉框架 ⇒ 地区回来了 ✓");
+        assert_eq!(youtube_verdict(&out).status, Status::Unlocked);
+    }
+
+    /// 剥框架的三条边界 ✓：普通块 ✓ · 带扩展 ✓ · **截断要交出已有的正文** ✓✗
+    #[test]
+    fn dechunk_strips_the_framing_and_never_eats_the_body() {
+        assert_eq!(dechunk(&chunked(&["hello ", "world"])), "hello world");
+        // 块大小后面可以带 `;扩展` ✓（RFC 允许 ✓，不处理的话整条正文都会读不到 ✓）
+        assert_eq!(dechunk("4;foo=bar\r\nbody\r\n0\r\n\r\n"), "body");
+        // ⚠️ 我们读到一半就停是**常事** ✓ ⇒ 截断**必须交出已拿到的** ✓，不能整条丢掉 ✓
+        let full = chunked(&["aaaa", "bbbb"]);
+        assert_eq!(dechunk(&full[..10]), "aaaa", "截断 ⇒ 拿到多少算多少 ✓");
+        // ⚠️ 第一行就不是块大小 ⇒ **原样返回** ✓（宁可不剥，也不吃掉正文 ✓）
+        assert_eq!(dechunk("这不是 chunked"), "这不是 chunked");
+        assert_eq!(dechunk(""), "");
+    }
+
+    /// `assemble` 只在响应自己说 chunked 时才动手 ✓ —— 头部**原样保留** ✓（状态码与跳转还要用 ✓）。
+    #[test]
+    fn assemble_dechunks_only_when_the_response_says_so() {
+        let raw =
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}", chunked(&["hello ", "world"]));
+        let text = assemble(raw.as_bytes());
+        assert!(text.ends_with("hello world"), "chunked ⇒ 剥掉框架 ✓");
+        assert!(text.contains("Transfer-Encoding: chunked"), "头部不动 ✓");
+        let plain = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        assert_eq!(assemble(plain.as_bytes()), plain, "不是 chunked ⇒ 一个字都不动 ✓");
+    }
+
+    /// ⚠️ "够了就停"的那个闸 ✓ —— 停早了会把**地区**弄丢 ✓✗，所以 `ad-free` 必须**连地区一起**才算够 ✓。
+    #[test]
+    fn youtube_stops_reading_only_when_the_verdict_is_settled() {
+        assert!(!youtube_decided("<html>ad-free</html>"), "只有 ad-free ⇒ 还不能停 ✓（地区可能在后头 ✓）");
+        assert!(youtube_decided(r#"<html>"contentRegion":"HK" ad-free</html>"#), "两者齐了 ⇒ 停 ✓");
+        // 这两档**各自就能定案** ✓（中国那档地区是硬写 CN ✓；禁会员那档没有地区 ✓）⇒ 见到就停 ✓
+        assert!(youtube_decided("<html>www.google.cn</html>"));
+        assert!(youtube_decided("<html>Premium is not available in your country</html>"));
+        assert!(!youtube_decided("<html>nothing yet</html>"), "什么都没读到 ⇒ 继续读 ✓");
+    }
+
+    /// ⚠️ 地区取**最后一处** ✓（参考的 `sed` 里 `.*` 贪婪 ⇒ 它也是最后一处 ✓；我们此前取第一处 ✗）。
+    #[test]
+    fn youtube_region_takes_the_last_one() {
+        assert_eq!(
+            youtube_region(r#""contentRegion":"US" …… "contentRegion":"HK""#).as_deref(),
+            Some("HK"),
+            "两处都有 ⇒ 取最后一处 ✓"
+        );
+        // ⚠️ "先给值、后给空"才是这一条真正的分叉点 ✓：最后一处不合法 ⇒ 就是"取不到" ✓
+        assert_eq!(youtube_region(r#""contentRegion":"US" "contentRegion":"""#), None);
     }
 }
