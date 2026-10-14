@@ -715,8 +715,12 @@ pub async fn fetch_status_capped(
             tokio::time::timeout(TIMEOUT, get_once(&current, extra_header, cap, done)).await??;
         if (300..400).contains(&status) {
             match header(&body[..headers_end.min(body.len())], "location") {
-                Some(loc) if loc.starts_with("https://") => current = loc,
-                Some(_) => anyhow::bail!("refusing a non-https redirect from {current}"),
+                // ⚠️ 相对跳转**要认** ✓（`resolve_location` 会拼成绝对 ✓）；
+                // 只有"解析不出来"或"会掉到明文"才拒绝 ✓ —— 那条安全规矩不动 ✓。
+                Some(loc) => match resolve_location(&current, &loc) {
+                    Some(next) => current = next,
+                    None => anyhow::bail!("refusing a non-https redirect from {current}: {loc}"),
+                },
                 // 跳转但没给目标 ⇒ 就当这是最终响应 ✓（状态码本身仍是信息 ✓）
                 None => return Ok((status, body)),
             }
@@ -896,6 +900,55 @@ fn parse_status_and_headers(text: &str) -> anyhow::Result<(u16, usize)> {
     // 头部与正文的分界 ✓；没有分界（被截断 ✓）就当作"全文都是头" ✓。
     let headers_end = text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(text.len());
     Ok((status, headers_end))
+}
+
+/// 把响应里的 `Location` 解析成**绝对 https URL** ✓✓（纯函数 ✓ —— 所以它有测试 ✓）。
+///
+/// ⚠️⚠️ 我们此前只接受 `starts_with("https://")` ✗✗ ⇒ **相对跳转被当成错误** ✓
+/// ⇒ 整次取页失败 ✓。实测（2026-10-13 ✓）：`https://www.primevideo.com` 的 302
+/// 给的就是**相对路径** `/offers/nonprimehomepage?ref_=...` ✓ ⇒ **PrimeVideo 取不到页** ✓✗。
+/// ⚠️ 而相对跳转是 RFC 允许、且**很常见**的 ✓，不是异常 ✓。
+///
+/// ⚠️ 但那条安全规矩**不动** ✗：**只跟 https** ✓ —— `http://` 一律拒绝 ✓
+///（明文跳转会被中间人改写 ✓，那比"取不到页"糟得多 ✓）。
+/// 三种相对形式都要认 ✓：`//host/path`（协议相对 ✓）· `/path`（根相对 ✓）· `path`（路径相对 ✓）。
+fn resolve_location(current: &str, loc: &str) -> Option<String> {
+    let loc = loc.trim();
+    if loc.starts_with("https://") {
+        return Some(loc.to_string());
+    }
+    // ⚠️ 明文一律拒绝 ✓（含 `http://` 与协议相对里显式写 http 的情形 ✓）
+    if loc.starts_with("http://") || loc.starts_with("//") && loc[2..].starts_with("http://") {
+        return None;
+    }
+    let (scheme, rest) = current.split_once("://")?;
+    if scheme != "https" {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if loc.starts_with("//") {
+        // 协议相对 ✓ ⇒ 补上当前协议 ✓
+        return Some(format!("https:{loc}"));
+    }
+    if loc.starts_with('/') {
+        return Some(format!("https://{authority}{loc}"));
+    }
+    if loc.is_empty() {
+        return None;
+    }
+    // ⚠️ 其它协议（`ftp://` ✓ `mailto:` ✓ …）**一律拒绝** ✗ ——
+    // 不拒的话会被当成"路径相对"拼到同一主机上 ✓✗（`https://host/ftp://a/b` ✓ 一个不存在的地址 ✓，
+    // 白白多花一次跳转 ✓，而且日志里会显得像"我们跟了它" ✓）。
+    if loc.contains("://") {
+        return None;
+    }
+    // 路径相对 ✓ ⇒ 拼到当前路径**最后一个 `/` 之前** ✓
+    let path = &rest[authority.len()..];
+    let base = match path.rfind('/') {
+        Some(i) => &path[..=i],
+        None => "/",
+    };
+    Some(format!("https://{authority}{base}{loc}"))
 }
 
 /// 从**响应头部**里取某个头 ✓（小写比较 ✓ —— HTTP 头不区分大小写 ✓）。
@@ -1471,5 +1524,39 @@ mod tests {
         );
         // ⚠️ "先给值、后给空"才是这一条真正的分叉点 ✓：最后一处不合法 ⇒ 就是"取不到" ✓
         assert_eq!(youtube_region(r#""contentRegion":"US" "contentRegion":"""#), None);
+    }
+
+    /// ⚠️⚠️ **相对跳转必须认** ✗✗ —— 实测（2026-10-13）：`https://www.primevideo.com`
+    /// 的 302 给的就是相对路径 ✓，而我们此前只接受 `https://` 开头 ⇒ **整个服务取不到页** ✗。
+    /// 而"只跟 https"那条安全规矩**不动** ✓。
+    #[test]
+    fn a_relative_redirect_is_resolved_against_the_current_url() {
+        let cur = "https://www.primevideo.com";
+        assert_eq!(
+            resolve_location(cur, "/offers/nonprimehomepage?ref_=dv_web_force_root").as_deref(),
+            Some("https://www.primevideo.com/offers/nonprimehomepage?ref_=dv_web_force_root"),
+            "根相对 ✓（实测就是这一条 ✓）"
+        );
+        assert_eq!(
+            resolve_location(cur, "https://a.example/b").as_deref(),
+            Some("https://a.example/b"),
+            "绝对 https 照旧 ✓"
+        );
+        assert_eq!(
+            resolve_location(cur, "//a.example/b").as_deref(),
+            Some("https://a.example/b"),
+            "协议相对 ✓"
+        );
+        assert_eq!(
+            resolve_location("https://a.example/x/y", "z").as_deref(),
+            Some("https://a.example/x/z"),
+            "路径相对 ⇒ 拼到当前路径最后一个 `/` 之前 ✓"
+        );
+        // ⚠️ 安全规矩**不动** ✓：明文一律拒绝 ✓（那比"取不到页"糟得多 ✓）
+        assert_eq!(resolve_location(cur, "http://a.example/b"), None, "明文必须拒绝 ✓");
+        // ⚠️ 其它协议不能被当路径拼 ✓（不然会造出一个同主机的怪地址 ✓）
+        assert_eq!(resolve_location(cur, "ftp://a.example/b"), None);
+        assert_eq!(resolve_location(cur, ""), None);
+        assert_eq!(resolve_location("http://a.example", "/x"), None, "起点就不是 https ⇒ 拒绝 ✓");
     }
 }
