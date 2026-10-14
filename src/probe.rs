@@ -626,15 +626,24 @@ pub fn is_bot_check(page: &str) -> bool {
 /// ⚠️ 形状检查照 Netflix 那条的规矩 ✓：**必须两位大写字母** ✓ ——
 /// 否则页面上任何 `"region":"…"` 都会被当地区 ✓✗（例如语言码 ✓、别的字段 ✓）。
 pub fn tiktok_region(page: &str) -> Option<String> {
-    let i = page.find("\"region\":\"")? + 10;
-    let rest = &page[i..];
-    let end = rest.find('"')?;
-    let code = &rest[..end];
-    if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
-        Some(code.to_string())
-    } else {
-        None
+    // ⚠️ 取**最后一处** ✓✓（参考：`grep '"region":' | sed 's/.*"region"//' | cut -f2 -d'"'` ✓ ——
+    // 那个 `.*` 是贪婪的 ✓，所以它拿到的是**最后一处** ✓）。与 YouTube 那条同一规矩 ✓。
+    const KEY: &str = "\"region\":\"";
+    let mut found: Option<String> = None;
+    let mut from = 0usize;
+    while let Some(i) = page[from..].find(KEY) {
+        let start = from + i + KEY.len();
+        from = start;
+        let Some(end) = page[start..].find('"') else { continue };
+        let code = &page[start..start + end];
+        // 形状检查照旧 ✓：必须两位大写 ✓（否则语言码/别的字段都会被当地区 ✓✗）
+        found = if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+            Some(code.to_string())
+        } else {
+            None
+        };
     }
+    found
 }
 
 /// TikTok 的判据 ✓✓ —— 纯函数 ✓，输入是**两次请求**的结果 ✓（主站 ✓ 与"带长 Accept 的那次" ✓）。
@@ -701,7 +710,13 @@ pub async fn run() -> Option<serde_json::Value> {
         };
         // ⚠️ 第二次**只在主站没给出地区时才发** ✗✓ —— 主站给了地区就已经是结论了 ✓
         //（解锁 ✓）⇒ 省掉一次对外请求 ✓✓（每个请求都是可被观察的流量 ✓）。
-        let second = if tiktok_region(&main).is_none() && !is_bot_check(&main) {
+        // ⚠️⚠️ **被拦截也要发第二次** ✗✗ —— 我先前这里多写了一道 `!is_bot_check(&main)` ✓，
+        // 于是"主站返回拦截页 ⇒ 干脆不发" ✓✗ —— 而参考实现**只在第一次**拿拦截页当门 ✓
+        //（`[[ $Ftmpresult == *"Please wait..."* ]] && … /explore` ✓），**第二次照样发** ✓。
+        // ⇒ ⭐ 那道门恰好砍掉了**能拿到 `idc` 的那条路** ✓（审计早就指出过 ✓）。
+        // ⚠️ 而"主站已经给出地区 ⇒ 不再发"这条**留着** ✗ —— 那是刻意的 ✓：
+        // 那时候结论已经是"解锁 + 地区" ✓，第二次不可能给出更多 ✓，而每个请求都是可被观察的流量 ✓。
+        let second = if tiktok_region(&main).is_none() {
             fetch_with(TIKTOK_MAIN, TIKTOK_BROWSER_ACCEPT).await.unwrap_or_default()
         } else {
             String::new()
@@ -1775,5 +1790,18 @@ mod tests {
             out.push_str(&"=".repeat(PAGE_FLOOR + 1 - out.len()));
         }
         out
+    }
+
+    /// ⚠️⚠️ **region 取最后一处** ✗✓ —— 参考的 `sed` 里 `.*` 是贪婪的 ✓；
+    /// 而"先给值、后给空"的页面正是这一条的分叉点 ✓（与 YouTube 那条同一规矩 ✓）。
+    #[test]
+    fn tiktok_region_takes_the_last_one() {
+        assert_eq!(
+            tiktok_region(r#"{"region":"US"} … {"region":"JP"}"#).as_deref(),
+            Some("JP"),
+            "两处都有 ⇒ 取最后一处 ✓"
+        );
+        assert_eq!(tiktok_region(r#"{"region":"US"} {"region":""}"#), None, "最后一处不合法 ⇒ 取不到 ✓");
+        assert_eq!(tiktok_region(r#"{"region":"us"}"#), None, "小写不算 ✓");
     }
 }
