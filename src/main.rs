@@ -386,6 +386,22 @@ async fn main() -> Result<()> {
         };
         return self_test(host).await;
     }
+    // 与上面 `--ping` 同一个位置、同一个理由：一次诊断既不需要服务器也不需要 token，
+    // 而 `parse_args` 两者都要。于是它可以在一台有问题的机器上直接跑，不用动 unit、
+    // 也不用等 6 小时一轮的排程。
+    if argv.iter().any(|a| a == "--probe-once") {
+        probe::start_diagnostics();
+        let report = probe::run().await;
+        for line in probe::take_diagnostics() {
+            println!("{line}");
+        }
+        match report {
+            Some(v) => println!("报文 {v}"),
+            None => println!("这一轮什么都没探到（全部失败）"),
+        }
+        return Ok(());
+    }
+
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
     // Reported once at startup. install.sh hardens this unit with

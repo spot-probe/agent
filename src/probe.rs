@@ -907,6 +907,7 @@ pub async fn fetch_page_capped(
             }
             continue;
         }
+        note(&current, status, &body);
         return Ok(Page { status, body, final_url: current });
     }
     anyhow::bail!("too many redirects starting at {url}")
@@ -945,6 +946,65 @@ pub async fn fetch_with_capped(
 
 /// 发一次请求并读回（**最多** `MAX_BYTES` ✓）。返回 `(状态码, 头部结束位置, 全文)`。
 /// ⚠️ 与 `fetch` 拆开只是为了让上面那段跳转逻辑**读起来是一件事** ✓。
+/// 诊断收集器（`--probe-once` 用）。
+///
+/// 为什么要它：判断、解分块、窗口、请求头、cookie 都验过之后，仍然有一台机器报
+/// "没读明白"。剩下能解释的只有"它读到的页面与 curl 读到的不一样"，而这件事
+/// 从外面看不见。所以让取页层自己把每一份响应的事实记下来：
+/// URL、状态码、正文长度、以及几个标记各出现几次。
+/// 于是"读到 94 万字节但 ad-free=0"（页面不同）与"只读到 12 万字节"（连接被关掉）
+/// 一眼就能分开，而这两条路的修法完全不同。
+///
+/// 平时零成本：一个原子布尔，关着的时候连锁都不碰。放在取页那一层而不是逐个服务里，
+/// 是因为那样不会漏（两页 Netflix、favicon、TikTok 的第二次请求都在这里经过）。
+static DIAG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DIAG_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// 打开诊断并清空上一次的。
+pub fn start_diagnostics() {
+    DIAG_LINES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    DIAG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 取走这一轮记下的，并关上诊断。
+pub fn take_diagnostics() -> Vec<String> {
+    DIAG_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::mem::take(&mut *DIAG_LINES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// 诊断里问的那几个标记，覆盖六个服务。多问几个没有代价（一轮六次字符串扫描）。
+const DIAG_NEEDLES: [&str; 8] = [
+    "ad-free",
+    "contentRegion",
+    "Oh no!",
+    "currentTerritory",
+    "\"region\":\"",
+    "unsupported_country",
+    "VPN",
+    "Please wait...",
+];
+
+/// 一份响应的事实，一行。纯函数，所以它有测试。
+pub fn diag_line(url: &str, status: u16, body: &str) -> String {
+    let mut out = format!("{url} status={status} bytes={}", body.len());
+    for needle in DIAG_NEEDLES {
+        let n = body.matches(needle).count();
+        if n > 0 {
+            out.push_str(&format!(" {}={n}", needle));
+        }
+    }
+    out
+}
+
+/// 记一份响应（只在诊断开着时）。
+fn note(url: &str, status: u16, body: &str) {
+    if !DIAG_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let line = diag_line(url, status, body);
+    DIAG_LINES.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+}
+
 /// 造一条 HTTP/1.1 请求 ✓✓（纯函数 ✓ —— 所以"发了几个 `Accept`"这种事**测得了** ✓）。
 ///
 /// ⚠️⚠️ **`User-Agent` 与 `Accept` 默认给，但能被 extra 覆盖** ✗✗ ——
@@ -1939,5 +1999,20 @@ mod tests {
         );
         assert_eq!(reddit_region(r#"country="US" country="JP""#).as_deref(), Some("US"), "第一个有效 ✓");
         assert_eq!(reddit_region(r#"country="jp" country="JPN""#), None, "都不合法 ⇒ 不给 ✓");
+    }
+
+    /// 诊断那一行只列**找到的**标记（免得一行里全是 =0，反而不好读）。
+    #[test]
+    fn a_diagnostic_line_counts_the_markers_it_finds() {
+        let line = diag_line("https://example/x", 200, "<html>ad-free ad-free contentRegion Oh no!</html>");
+        assert!(line.contains("status=200"), "状态码要在 ✓: {line}");
+        assert!(line.contains("bytes="), "长度要在 ✓: {line}");
+        assert!(line.contains("ad-free=2"), "数出现的次数 ✓: {line}");
+        assert!(line.contains("contentRegion=1"), "{line}");
+        assert!(line.contains("Oh no!=1"), "{line}");
+        // 没找到的**不出现** ✓
+        assert!(!line.contains("currentTerritory"), "{line}");
+        assert!(!line.contains("VPN"), "{line}");
+        assert!(!line.contains("Please wait"), "{line}");
     }
 }
