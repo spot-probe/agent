@@ -331,6 +331,16 @@ const MAX_BYTES: usize = 512 * 1024;
 /// ⇒ 判中国/禁会员时**几乎立刻收手** ✓，只有"解锁"那一档才真的要读到 ~820 KB ✓。
 const YOUTUBE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+/// ⚠️⚠️ **Netflix 单独的上限** ✗✗ —— 它的两个 title 页面实测是 **2.2–2.3 MB**
+///（2026-10-15 ✓ 从代理出口实测：2,287,053 与 2,307,829 字节 ✓），
+/// 而默认的 `MAX_BYTES` 是 512 KB ⇒ 只读到前 512 KB ✓✗。
+/// ⭐ 诊断把它钉死了 ✓：`--probe-once` 打出来的是 `bytes=524034`（≈512 KiB 那个上限 ✓），
+/// 两页都是这个数 ⇒ 读不到 `Oh no!`、也读不到地区 ⇒ 判成"解锁" ✓✗。
+/// ⚠️ 这已经是**第二次**同一个教训 ✗：YouTube 那次也是 512 KB 不够 ✓。
+/// ⇒ 所以规矩记在这里 ✓：**每个服务各自定窗口，按实测的页面大小给足余量** ✓；
+///    默认那个 512 KB 只适用于小页面 ✓。
+const NETFLIX_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// ⚠️⚠️ **"看着就不像产品页"的响应，不许被读成结论** ✗✗ —— 这一条治的是一整类**安静的错值** ✓：
 /// 限流页 ✓ 机器人页 ✓ 网关错误页 ✓ **都是 200** ✓，正文很小 ✓，里面当然也没有我们要找的标记 ✓
 /// ⇒ 判据就会得出"**未解锁**"（甚至"解锁" ✓✗）—— ⭐ 一个**看起来很正常的错结论** ✓。
@@ -737,7 +747,11 @@ pub async fn run() -> Option<serde_json::Value> {
     let mut out = serde_json::Map::new();
 
     // Netflix ✓：两页**并行**取 ✓（串行是白等一倍 ✓）；任一失败 ⇒ 这个服务这次不报 ✓。
-    let (a, b) = tokio::join!(fetch(NETFLIX_PAGES[0]), fetch(NETFLIX_PAGES[1]));
+    let (a, b) = tokio::join!(
+        fetch_with_capped(NETFLIX_PAGES[0], "", NETFLIX_MAX_BYTES, &|_| false),
+        fetch_with_capped(NETFLIX_PAGES[1], "", NETFLIX_MAX_BYTES, &|_| false)
+    );
+    // ⚠️ 走**带上限**那条路 ✓（两个 title 页面都在 2 MB 以上 ✓，默认 512 KB 读不全 ✓）。
     if let (Ok(pa), Ok(pb)) = (a, b) {
         merge(&mut out, verdict_json("netflix", &netflix_verdict(&pa, &pb)));
     }
@@ -959,10 +973,17 @@ pub async fn fetch_with_capped(
 /// 是因为那样不会漏（两页 Netflix、favicon、TikTok 的第二次请求都在这里经过）。
 static DIAG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DIAG_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// 落盘目录（诊断时可选）。有些问题只有看见正文才能定性——
+/// 比如"服务端给我们的是一页 33 KB 的东西，而 curl 拿到的是 950 KB 的正常页"，
+/// 那一页是什么，光看长度猜不出来。
+static DIAG_DUMP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static DIAG_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// 打开诊断并清空上一次的。
-pub fn start_diagnostics() {
+/// 打开诊断并清空上一次的。给了目录就顺便把每份正文落盘。
+pub fn start_diagnostics(dump_dir: Option<String>) {
     DIAG_LINES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *DIAG_DUMP.lock().unwrap_or_else(|e| e.into_inner()) = dump_dir;
+    DIAG_SEQ.store(0, std::sync::atomic::Ordering::Relaxed);
     DIAG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -1002,7 +1023,15 @@ fn note(url: &str, status: u16, body: &str) {
         return;
     }
     let line = diag_line(url, status, body);
-    DIAG_LINES.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+    DIAG_LINES.lock().unwrap_or_else(|e| e.into_inner()).push(line.clone());
+    // 给了目录就落盘。文件名带序号，于是顺序与上面那几行一一对应。
+    let dump = DIAG_DUMP.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(dir) = dump {
+        let n = DIAG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::path::Path::new(&dir).join(format!("{n:02}.txt"));
+        let header = format!("# {line}\n\n");
+        let _ = std::fs::write(&path, format!("{header}{body}"));
+    }
 }
 
 /// 造一条 HTTP/1.1 请求 ✓✓（纯函数 ✓ —— 所以"发了几个 `Accept`"这种事**测得了** ✓）。

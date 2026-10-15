@@ -390,7 +390,16 @@ async fn main() -> Result<()> {
     // 而 `parse_args` 两者都要。于是它可以在一台有问题的机器上直接跑，不用动 unit、
     // 也不用等 6 小时一轮的排程。
     if argv.iter().any(|a| a == "--probe-once") {
-        probe::start_diagnostics();
+        // 可选：`--dump-body <目录>` 把每份正文也写进去。有些问题只有看见正文才能定性
+        //（例如"服务端给我们的是一页 33 KB 的东西，而 curl 拿到的是 950 KB"）。
+        let dump = argv.iter().position(|a| a == "--dump-body").and_then(|i| argv.get(i + 1)).cloned();
+        if let Some(dir) = dump.as_deref() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("--dump-body {dir} 建不出来：{e}");
+                std::process::exit(2);
+            }
+        }
+        probe::start_diagnostics(dump);
         let report = probe::run().await;
         for line in probe::take_diagnostics() {
             println!("{line}");
