@@ -921,8 +921,11 @@ pub async fn fetch_page_capped(
             }
             continue;
         }
-        note(&current, status, &body);
-        return Ok(Page { status, body, final_url: current });
+        // ⚠️ 交给判据的**只留正文** ✗（见 `body_of` 的说明：头部里有假阳性）。
+        // 跳转判定用的是上面切出来的头部，不受这里影响。
+        let page_body = body_of(&body).to_string();
+        note(&current, status, &page_body);
+        return Ok(Page { status, body: page_body, final_url: current });
     }
     anyhow::bail!("too many redirects starting at {url}")
 }
@@ -1034,6 +1037,22 @@ fn note(url: &str, status: u16, body: &str) {
     }
 }
 
+/// **只取正文**：头部之后的全部内容。纯函数，所以它有测试。
+///
+/// ⚠️⚠️ 这个函数是 2026-10-15 那次事故的直接产物：YouTube 的响应头里有一条
+/// `connection-allowlist-report-only`，那串名单**包含 `https://www.google.cn`**。
+/// 而"读够了就停"的判据当时是拿**整份响应**（含头部）去找标记的，于是第一批字节就命中，
+/// 读到 33,138 字节就收手，真正的标记在 818 KB 处永远读不到——面板上就是"没读明白"。
+/// ⇒ 判据是**关于正文**的，就必须只看正文。
+fn body_of(text: &str) -> &str {
+    match text.find("\r\n\r\n") {
+        Some(i) => &text[i + 4..],
+        // 没有分界（被截断，或压根不是 HTTP 响应）⇒ 整份都算正文。
+        // 宁可多给一点，也不要因为找不到分界就交出空串——那会把判据饿死。
+        None => text,
+    }
+}
+
 /// 造一条 HTTP/1.1 请求 ✓✓（纯函数 ✓ —— 所以"发了几个 `Accept`"这种事**测得了** ✓）。
 ///
 /// ⚠️⚠️ **`User-Agent` 与 `Accept` 默认给，但能被 extra 覆盖** ✗✗ ——
@@ -1109,7 +1128,7 @@ async fn get_once(
         // 每读一小块就查一次会变成平方级 ✓（8 KB 一块 ⇒ 100 多次重解 ✓）。
         if buf.len() - checked >= 32 * 1024 {
             checked = buf.len();
-            if done(&assemble(&buf)) {
+            if done(body_of(&assemble(&buf))) {
                 break;
             }
         }
@@ -2043,5 +2062,30 @@ mod tests {
         assert!(!line.contains("currentTerritory"), "{line}");
         assert!(!line.contains("VPN"), "{line}");
         assert!(!line.contains("Please wait"), "{line}");
+    }
+
+    /// ⚠️⚠️ **头部里的字符串不算判据** ✗✗ —— 这条是 2026-10-15 那次事故的回归闸。
+    ///
+    /// YouTube 的响应头里有一条 `connection-allowlist-report-only`，名单里含
+    /// `https://www.google.cn`。判据当时拿**整份响应**去找它 ⇒ 第一批字节就命中 ⇒
+    /// 读到 33 KB 就停手 ⇒ 真正的标记（818 KB 处的 `ad-free`）永远读不到 ⇒ 面板报"没读明白"。
+    /// 本地怎么验都验不出来，因为 curl 下来的是正文、没有头部。
+    #[test]
+    fn markers_in_the_response_headers_do_not_count() {
+        let head = "HTTP/1.1 200 OK\r\nconnection-allowlist-report-only: (\"https://www.google.cn\")\r\n\r\n";
+        let text = format!("{head}<html>a normal page without markers</html>");
+        assert!(text.contains("www.google.cn"), "整份响应里当然有它 ✓");
+        assert!(!body_of(&text).contains("www.google.cn"), "但正文里没有 ✓");
+        // 注意这里断言的是**调用点的契约**，不是那个函数变得更聪明了。
+        // youtube_decided 本身就是个纯扫描器：它只认字符串，不知道哪儿是头部。
+        // 所以**喂给它什么**才是这条 bug 的所在。我第一版把断言写成
+        // !youtube_decided(&text)，那等于要求函数自己会剥头部，是断言写错了。
+        assert!(youtube_decided(&text), "纯扫描器照旧会命中，这正是要防的那件事");
+        assert!(!youtube_decided(body_of(&text)), "只看正文时就不会命中");
+        // 正文里真的有标记时照旧要停 ✓（别把孩子跟水一起倒了）
+        let real = format!("{head}<html>ad-free and \"contentRegion\":\"US\"</html>");
+        assert!(youtube_decided(body_of(&real)), "正文里有标记 ⇒ 该停 ✓");
+        // 没有分界时整份算正文 ✓（宁可多给，也不要交出空串把判据饿死）
+        assert_eq!(body_of("<html>no boundary</html>"), "<html>no boundary</html>");
     }
 }
