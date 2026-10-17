@@ -66,7 +66,12 @@ pub struct State {
 }
 
 /// 一次升级最多收多大。与 hub 侧的分片上限无关：agent 只认签名，签名过了才谈大小。
-pub const MAX: usize = 64 * 1024 * 1024;
+///
+/// ⚠️ **不能与 unit 的 `MemoryMax` 一样大** ✗✗ —— 它们曾经都是 64 MiB，而那是**不可达**的：
+/// 收满 64 MiB 之前（`Vec` 还要倍增一次）就会被 cgroup 杀掉；杀掉后 systemd 重启、
+/// hub 再公告、再 OOM。16 MiB 对 musl 静态二进制有充足余量（实测几 MB），
+/// 而 `MemoryMax=64M` 留出了「接收 + 验签 + 落盘」的峰值空间。
+pub const MAX: usize = 16 * 1024 * 1024;
 
 impl State {
     /// 处理一条**文本** rpc。`allowed` 是本机开关（`--allow-remote-upgrade`），
