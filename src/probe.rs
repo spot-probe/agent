@@ -323,6 +323,11 @@ pub fn verdict_json(service: &str, v: &Verdict) -> serde_json::Value {
 /// ⚠️ 写在两处会漂移 ✓：改了一处、另一处还是旧值 ✓，而那种不一致**不报错** ✓✗。
 const MAX_BYTES: usize = 512 * 1024;
 
+/// AmazonPV 的上限。⚠️ 实测页 **506 KB**，而 `MAX_BYTES` 是 512 KB ⇒ 只剩 6 KB 余量：
+/// 页面稍微长一点（或读得慢一点），`currentTerritory` 就在没读到的那一半里，
+/// 判据于是报一条红色的"未解锁"。给到 1 MiB 并配合截断标记兜底。
+const AMAZONPV_MAX_BYTES: usize = 1024 * 1024;
+
 /// ⚠️⚠️ **YouTube 单独的上限** ✗✗ —— 它的 `ad-free` 出现在**字节 813,352**（整页 941,197 ✓，
 /// 2026-10-13 实测 ✓），而上面的全局 `MAX_BYTES` 是 512 KB ⇒ **三个标记一个都读不到** ✓✗
 /// ⇒ 这个服务此前**永远判"没读明白"** ✓，而且**看不出来** ✓（面板上就是一个灰胶囊 ✓）。
@@ -755,12 +760,16 @@ pub async fn run() -> Option<serde_json::Value> {
 
     // Netflix ✓：两页**并行**取 ✓（串行是白等一倍 ✓）；任一失败 ⇒ 这个服务这次不报 ✓。
     let (a, b) = tokio::join!(
-        fetch_with_capped(NETFLIX_PAGES[0], "", NETFLIX_MAX_BYTES, &|_| false),
-        fetch_with_capped(NETFLIX_PAGES[1], "", NETFLIX_MAX_BYTES, &|_| false)
+        fetch_with_capped_meta(NETFLIX_PAGES[0], "", NETFLIX_MAX_BYTES, &|_| false),
+        fetch_with_capped_meta(NETFLIX_PAGES[1], "", NETFLIX_MAX_BYTES, &|_| false)
     );
     // ⚠️ 走**带上限**那条路 ✓（两个 title 页面都在 2 MB 以上 ✓，默认 512 KB 读不全 ✓）。
-    if let (Ok(pa), Ok(pb)) = (a, b) {
-        merge(&mut out, verdict_json("netflix", &netflix_verdict(&pa, &pb)));
+    if let (Ok((pa, ta)), Ok((pb, tb))) = (a, b) {
+        let v = netflix_verdict(&pa, &pb);
+        // ⚠️ 截断时"没看到 `Oh no!`"不等于可用 —— 那个标记可能就在没读到的那一半里。
+        // 只有**确认看到了**（`Blocked`）才保留结论，其余降为"没读明白"。
+        let confirmed = v.status == Status::Blocked;
+        merge(&mut out, verdict_json("netflix", &unless_absent(v, ta || tb, confirmed)));
     }
 
     // TikTok ✓：主站 ⇒ 被拦截就换 fallback 再取一次 ✓ ⇒ 需要时才发第二次（带浏览器 Accept ✓）。
@@ -820,8 +829,14 @@ pub async fn run() -> Option<serde_json::Value> {
     }
 
     // AmazonPV ✓：最干净的一个 ✓ —— 一个 GET、一个字段、三个既有状态 ✓✓。
-    if let Ok(body) = fetch(AMAZONPV_URL).await {
-        merge(&mut out, verdict_json("amazonpv", &amazonpv_verdict(&body)));
+    if let Ok((body, truncated)) =
+        fetch_with_capped_meta(AMAZONPV_URL, "", AMAZONPV_MAX_BYTES, &|_| false).await
+    {
+        let v = amazonpv_verdict(&body);
+        // ⚠️ 截断时"没看到 `currentTerritory`"不等于没有 —— 降为"没读明白"，
+        // 不要报一条红色的"未解锁"。
+        let confirmed = v.status == Status::Unlocked;
+        merge(&mut out, verdict_json("amazonpv", &unless_absent(v, truncated, confirmed)));
     }
 
     // YouTube ✓：要带那两个头 ✓（否则页面上那几个字符串对不上 ✓✗）。
@@ -900,6 +915,13 @@ pub struct Page {
     pub status: u16,
     pub body: String,
     pub final_url: String,
+    /// 正文**是否被上限截断** ✗✓ —— 见 `truncated_of` 与两个用它的服务。
+    ///
+    /// 为什么必须带出去：判据里有一类结论是"**没看到某个标记** ⇒ 判定"（AmazonPV 没看到
+    /// `currentTerritory` 就是"未解锁"，Netflix 没看到 `Oh no!` 就是"可用"）。而"没看到"
+    /// 有两种原因：整页读完了确实没有，或者**根本没读到那一半**。两者混在一起，就会出现
+    /// 红色"未解锁"而实际可用 —— 这正是"失败不是结论"那条规矩要挡的。
+    pub truncated: bool,
 }
 
 pub async fn fetch_page_capped(
@@ -913,7 +935,7 @@ pub async fn fetch_page_capped(
 
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
-        let (status, headers_end, body) =
+        let (status, headers_end, body, truncated) =
             tokio::time::timeout(TIMEOUT, get_once(&current, extra_header, cap, done)).await??;
         if (300..400).contains(&status) {
             match header(&body[..headers_end.min(body.len())], "location") {
@@ -924,7 +946,7 @@ pub async fn fetch_page_capped(
                     None => anyhow::bail!("refusing a non-https redirect from {current}: {loc}"),
                 },
                 // 跳转但没给目标 ⇒ 就当这是最终响应 ✓（状态码本身仍是信息 ✓）
-                None => return Ok(Page { status, body, final_url: current }),
+                None => return Ok(Page { status, body, final_url: current, truncated }),
             }
             continue;
         }
@@ -932,9 +954,38 @@ pub async fn fetch_page_capped(
         // 跳转判定用的是上面切出来的头部，不受这里影响。
         let page_body = body_of(&body).to_string();
         note(&current, status, &page_body);
-        return Ok(Page { status, body: page_body, final_url: current });
+        return Ok(Page { status, body: page_body, final_url: current, truncated });
     }
     anyhow::bail!("too many redirects starting at {url}")
+}
+
+/// 判据里"**没看到某个标记 ⇒ 判定**"的那一类，在正文被截断时**不能成立**。
+///
+/// `confirmed` 表示"这条结论不是靠缺席得出的"（例如真的在页面上看到了 `Oh no!`）。
+/// 截断 + 靠缺席 ⇒ 降级为"没读明白"：`UNKNOWN` 是实话，"未解锁"是错话。
+///
+/// 抽成纯函数是为了能测 —— 两个调用点（AmazonPV、Netflix）此前各自内联，而它们正是
+/// "看起来正常但结论是错的"那类 bug 的产地。
+fn unless_absent(v: Verdict, truncated: bool, confirmed: bool) -> Verdict {
+    if truncated && !confirmed {
+        Verdict { status: Status::Unknown, region: None }
+    } else {
+        v
+    }
+}
+
+/// 同 [`fetch_with`] ✓，并告诉你**正文是不是被上限截断** ✓✓。
+///
+/// 只有需要它的人用：判断"没看到某个标记 ⇒ 判定"的服务必须区分"整页没有"与"没读到"，
+/// 否则一次截断就变成一条错结论（AmazonPV 的红色"未解锁"、Netflix 的假"可用"）。
+pub async fn fetch_with_capped_meta(
+    url: &str,
+    extra_header: &str,
+    cap: usize,
+    done: &(dyn Fn(&str) -> bool + Send + Sync),
+) -> anyhow::Result<(String, bool)> {
+    let page = fetch_page_capped(url, extra_header, cap, done).await?;
+    Ok((page.body, page.truncated))
 }
 
 /// 同 [`fetch_page_capped`] ✓，但只交出**状态码与正文** ✓（多数调用者只要这两样 ✓）。
@@ -1094,7 +1145,7 @@ async fn get_once(
     extra_header: &str,
     cap: usize,
     done: &(dyn Fn(&str) -> bool + Send + Sync),
-) -> anyhow::Result<(u16, usize, String)> {
+) -> anyhow::Result<(u16, usize, String, bool)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let rest = url.strip_prefix("https://").ok_or_else(|| anyhow!("not https: {url}"))?;
@@ -1121,6 +1172,7 @@ async fn get_once(
     tls.write_all(req.as_bytes()).await?;
 
     let mut buf = Vec::new();
+    let mut truncated = false;
     let mut chunk = [0u8; 8192];
     let mut checked = 0usize;
     loop {
@@ -1141,12 +1193,15 @@ async fn get_once(
         }
         if buf.len() >= cap {
             buf.truncate(cap);
+            // ⚠️ **记下来** ✗✓：截断与"读完了"必须能区分——下游有一类结论是
+            // "没看到某个标记 ⇒ 判定"，而"没读到"不是"没有"。
+            truncated = true;
             break;
         }
     }
     let text = assemble(&buf);
     let (status, headers_end) = parse_status_and_headers(&text)?;
-    Ok((status, headers_end, text))
+    Ok((status, headers_end, text, truncated))
 }
 
 /// 把**原始响应字节**变成"头部 + 正文"文本 ✓✓。
@@ -1868,6 +1923,28 @@ mod tests {
         assert!(text.contains("Transfer-Encoding: chunked"), "头部不动 ✓");
         let plain = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         assert_eq!(assemble(plain.as_bytes()), plain, "不是 chunked ⇒ 一个字都不动 ✓");
+    }
+
+    /// 截断时，**靠"缺席"得出的结论不成立**。
+    ///
+    /// AmazonPV 实测页 506 KB、上限曾是 512 KB：只剩 6 KB 余量，`currentTerritory` 落在
+    /// 截断点之后就报出一条红色"未解锁"；Netflix 同路会报"可用"。两条都是"看起来正常"的错。
+    #[test]
+    fn a_truncated_page_cannot_be_judged_by_what_is_missing() {
+        // ⚠️ 页面必须**过得了 `PAGE_FLOOR`** 那道地板，否则结论本来就是 Unknown ——
+        // 那是另一道闸（"小页不是页面"），会把这条用例的意图盖住。我第一次就踩了。
+        let page = |snippet: &str| format!("<html>{snippet}{}</html>", "x".repeat(PAGE_FLOOR));
+        // 看到了地区 ⇒ 这是"看到了"的结论，截断不影响。
+        let unlocked = amazonpv_verdict(&page(r#""currentTerritory":"JP""#));
+        assert_eq!(unlocked.status, Status::Unlocked, "前提：这页确实给了地区");
+        assert_eq!(unless_absent(unlocked, true, true).status, Status::Unlocked);
+        // 没看到地区 ⇒ 靠缺席；截断时必须降级。
+        let absent = amazonpv_verdict(&page("no territory here"));
+        assert_eq!(absent.status, Status::Blocked, "整页读完、真的没有 ⇒ 未解锁");
+        assert_eq!(unless_absent(absent, true, false).status, Status::Unknown, "截断 ⇒ 不给结论");
+        // 没截断 ⇒ 原样。
+        let absent = amazonpv_verdict(&page("no territory here"));
+        assert_eq!(unless_absent(absent, false, false).status, Status::Blocked);
     }
 
     /// 块边界落在多字节字符中间时，**必须不 panic**。
