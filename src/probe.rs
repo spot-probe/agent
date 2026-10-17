@@ -439,8 +439,15 @@ pub fn youtube_is_cn_final(final_url: &str) -> bool {
 ///   · `ad-free` ⇒ 判解锁 ✓，但同一条判据**还要取地区** ✓ ⇒ 必须**连 `contentRegion` 一起**见到 ✓✗
 ///     （停早了会把地区弄丢 ✓ —— 而"状态对、地区静默消失"正是本仓最怕的那类错 ✓）。
 pub fn youtube_decided(body: &str) -> bool {
-    body.contains("www.google.cn")
-        || body.contains("Premium is not available in your country")
+    // ⚠️⚠️ **这里没有 `www.google.cn`** ✗✗ —— 它曾经是一条"够了就停"的判据，而
+    // `youtube_verdict` 早就把"正文含这个域名 ⇒ 中国版"删掉了（那是误报来源：正文里 0 次，
+    // 面板却报「中国区」）。两处不一致的后果是：页面里只要**任何地方**出现这个域名
+    // （hreflang 链接、页脚、脚本），我们就在 ~32KB 处停手，而 `ad-free` 在 ~815KB 处
+    // ⇒ 判成"没读明白"。这是"先看头部"那次事故的**同一形状**，触发点挪进了正文。
+    //
+    // 中国版现在**只由最终主机判定**（见 [`youtube_is_cn_final`]）。所以这里只留两条
+    // 真正能定案的信号：禁会员那句，以及"ad-free + 地区"同时到位。
+    body.contains("Premium is not available in your country")
         || (body.contains("ad-free") && body.contains("\"contentRegion\""))
 }
 
@@ -1177,22 +1184,30 @@ fn assemble(raw: &[u8]) -> String {
 ///      绝不因为"不完整"就整条丢掉 ✓（丢掉等于把读到的正文扔了 ✓）。
 /// ⚠️ 若**第一行就不是块大小** ⇒ **原样返回** ✓ —— 宁可不剥，也不吃掉正文 ✓。
 fn dechunk(body: &str) -> String {
-    // ⚠️ **先确认"第一行确实是块大小"** ✗✓ —— 不是（含"连行尾都没有"的截断）⇒ **原样返回** ✓。
-    // ⚠️ 我第一版漏了这一步 ✓✗：那种输入会一路 `break` 出去 ⇒ **返回空串** ✓
-    // ⇒ 正好违反"宁可不剥，也不吃掉正文"那条契约 ✓（写测试时才发现 ✓）。
-    let is_size_line =
-        |line: &str| usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16).is_ok();
-    match body.find("\r\n") {
-        Some(eol) if is_size_line(&body[..eol]) => {}
+    // ⚠️⚠️ **全程按字节切** ✗✗ —— 块大小是**字节数**，而 `&str` 按下标切要求落在字符边界上。
+    // 这不只是理论风险：`assemble` 先做了一次 `from_utf8_lossy`，非法字节被替换成三字节的
+    // U+FFFD ⇒ **偏移整体漂移**，服务端给的 size 于是完全可能落在某个多字节字符中间。
+    // 旧实现在那里 `&rest[..size]` ⇒ panic，而 release 是 `panic = "abort"` ⇒ **整个 agent 被
+    // abort**；更糟的是 `remember()` 还没执行，重启后 `due()` 仍为真 ⇒ 每 5 秒重探、再 abort
+    // （`Restart=always`）。一次分块响应就能把一台机器变成崩溃循环。
+    //
+    // 与前面几条同样的三条规矩：块大小是十六进制且可带 `;扩展`、见到 0 收手、
+    // **截断时把读到的交出去**、第一行不是块大小就原样返回。
+    let bytes = body.as_bytes();
+    let crlf = |b: &[u8]| b.windows(2).position(|w| w == b"\r\n");
+    let size_of = |line: &[u8]| -> Option<usize> {
+        std::str::from_utf8(line)
+            .ok()
+            .and_then(|s| usize::from_str_radix(s.split(';').next().unwrap_or("").trim(), 16).ok())
+    };
+    match crlf(bytes) {
+        Some(eol) if size_of(&bytes[..eol]).is_some() => {}
         _ => return body.to_string(),
     }
-    let mut out = String::with_capacity(body.len());
-    let mut rest = body;
-    // ⚠️ 写成 `while let` ✓（clippy 那条 `never_loop`/`while_let_loop` 是对的 ✓：
-    // 循环体第一件事就是"找不到行尾就出去" ⇒ 那本来就是 while 的条件 ✓）。
-    while let Some(eol) = rest.find("\r\n") {
-        let size_txt = rest[..eol].split(';').next().unwrap_or("").trim();
-        let Ok(size) = usize::from_str_radix(size_txt, 16) else {
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(eol) = crlf(rest) {
+        let Some(size) = size_of(&rest[..eol]) else {
             return body.to_string();
         };
         rest = &rest[eol + 2..];
@@ -1200,18 +1215,17 @@ fn dechunk(body: &str) -> String {
             break;
         }
         if rest.len() < size {
-            out.push_str(rest);
+            out.extend_from_slice(rest);
             break;
         }
-        out.push_str(&rest[..size]);
+        out.extend_from_slice(&rest[..size]);
         rest = &rest[size..];
-        // 数据后面应当有一个 CRLF ✓；没有（截断）就到此为止 ✓
-        match rest.strip_prefix("\r\n") {
+        match rest.strip_prefix(b"\r\n".as_slice()) {
             Some(next) => rest = next,
             None => break,
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 从响应里读状态码与"头部结束"的位置 ✓（纯函数 ✓ —— 所以它有测试 ✓✓）。
@@ -1856,13 +1870,30 @@ mod tests {
         assert_eq!(assemble(plain.as_bytes()), plain, "不是 chunked ⇒ 一个字都不动 ✓");
     }
 
+    /// 块边界落在多字节字符中间时，**必须不 panic**。
+    ///
+    /// 块大小是字节数，而 `&str` 按下标切要求落在字符边界上 —— 旧实现在这里 panic，
+    /// release 是 `panic = "abort"` ⇒ 整个 agent 被 abort，而 `remember()` 还没执行、
+    /// 重启后立刻再探 ⇒ 每 5 秒一轮的崩溃循环。所以这条用例守的是"能不能继续跑"。
+    #[test]
+    fn dechunk_splits_on_bytes_not_characters() {
+        // "中" 占 3 字节，而声明块大小 1 ⇒ 边界正好落在它中间。
+        let out = dechunk("1\r\n中\r\n0\r\n\r\n");
+        assert!(!out.is_empty(), "读到的字节要交出去，不能丢掉");
+        // 正常的块、含中文，边界对齐 ⇒ 原样还原。
+        let ok = dechunk("3\r\n中\r\n3\r\nabc\r\n0\r\n\r\n");
+        assert_eq!(ok, "中abc");
+    }
+
     /// ⚠️ "够了就停"的那个闸 ✓ —— 停早了会把**地区**弄丢 ✓✗，所以 `ad-free` 必须**连地区一起**才算够 ✓。
     #[test]
     fn youtube_stops_reading_only_when_the_verdict_is_settled() {
         assert!(!youtube_decided("<html>ad-free</html>"), "只有 ad-free ⇒ 还不能停 ✓（地区可能在后头 ✓）");
         assert!(youtube_decided(r#"<html>"contentRegion":"HK" ad-free</html>"#), "两者齐了 ⇒ 停 ✓");
-        // 这两档**各自就能定案** ✓（中国那档地区是硬写 CN ✓；禁会员那档没有地区 ✓）⇒ 见到就停 ✓
-        assert!(youtube_decided("<html>www.google.cn</html>"));
+        // ⚠️ **域名不是停手信号** ✗✗ —— 它曾经是，但 `youtube_verdict` 早就不拿它判中国版了；
+        // 留着它只会让我们在 32KB 处停手，把 815KB 处的 `ad-free` 挡在外面（判成"没读明白"）。
+        assert!(!youtube_decided("<html>www.google.cn</html>"), "域名出现不等于读够了");
+        // 禁会员那档没有地区 ✓、见到就能定案 ✓
         assert!(youtube_decided("<html>Premium is not available in your country</html>"));
         assert!(!youtube_decided("<html>nothing yet</html>"), "什么都没读到 ⇒ 继续读 ✓");
     }
@@ -2080,7 +2111,9 @@ mod tests {
         // youtube_decided 本身就是个纯扫描器：它只认字符串，不知道哪儿是头部。
         // 所以**喂给它什么**才是这条 bug 的所在。我第一版把断言写成
         // !youtube_decided(&text)，那等于要求函数自己会剥头部，是断言写错了。
-        assert!(youtube_decided(&text), "纯扫描器照旧会命中，这正是要防的那件事");
+        // ⚠️ 现在这一条更强：扫描器**完全不认**这个域名了 —— 所以无论它在头部还是正文里，
+        // 都不可能再触发"提前停手"。旧断言写的是 `assert!(...)`，那时它确实会命中。
+        assert!(!youtube_decided(&text), "域名在头部也不该触发停手");
         assert!(!youtube_decided(body_of(&text)), "只看正文时就不会命中");
         // 正文里真的有标记时照旧要停 ✓（别把孩子跟水一起倒了）
         let real = format!("{head}<html>ad-free and \"contentRegion\":\"US\"</html>");
