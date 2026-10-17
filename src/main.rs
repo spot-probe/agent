@@ -90,7 +90,7 @@ fn finish_upgrade(ok: bool, apply_ready: bool, version: &str, reason: &str, tx: 
         return;
     }
     // 交给 `commit` 的是"**即将被换下**的那个版本" = 现在运行着的这一个。
-    match apply::Plan::current().and_then(|p| apply::commit(&p, env!("CARGO_PKG_VERSION"))) {
+    match apply::Plan::current().and_then(|p| apply::commit(&p, env!("CARGO_PKG_VERSION"), version)) {
         Ok(()) => {
             eprintln!("已换上 {version}：退出，让 systemd 拉起新版本（启动后会自检）");
             tokio::spawn(async {
@@ -128,6 +128,18 @@ fn self_check_after_upgrade() {
     };
     match apply::marker_versions(&plan) {
         Some((from, to)) => {
+            // ⚠️⚠️ **换上来的必须就是公告的那一版** ✗✗ —— 签名只覆盖**字节**，而"版本"是 hub
+            // 说的：它可以公告一个更高的版本、却喂一个**更旧的、已签名的**二进制。那种情况下
+            // 我们刚把自己降级了，而连接一切正常 ⇒ 180 秒自检会放行。所以先比版本：
+            // 不一致就**立刻回滚**，不等自检。
+            if !apply::same_version(env!("CARGO_PKG_VERSION"), &to) {
+                eprintln!("升级异常：公告的是 {to}，实际运行的是 {} ⇒ 立即回滚", env!("CARGO_PKG_VERSION"));
+                match apply::rollback(&plan) {
+                    Ok(()) => std::process::exit(1),
+                    Err(e) => eprintln!("回滚失败：{e:#} —— 这台机器需要 SSH"),
+                }
+                return;
+            }
             eprintln!("刚升级过（{from} → {to}）：{} 秒内连不上 hub 就回滚", SELF_CHECK.as_secs())
         }
         None => eprintln!("刚升级过：{} 秒内连不上 hub 就回滚", SELF_CHECK.as_secs()),
@@ -431,22 +443,27 @@ async fn main() -> Result<()> {
     );
     let mut wait = 0u64;
 
+    // ⚠️ **探测状态与"首探相位"必须活过重连** ✗✗ —— 它们此前在 `session()` 里建：每断一次线
+    // `started` 就归零 ⇒ 首探相位要重新等一遍（连接比相位短的话**永远等不到首探**）；
+    // 没有 `StateDirectory=` 的老安装连"上次探过"也随之丢掉（重连后又探一轮）。
+    // 提到这里：一个进程只有一份状态，重连不再影响它。
+    let probe_state = std::sync::Arc::new(probe::State::new(probe::state_dir(
+        std::env::var("STATE_DIRECTORY").ok().as_deref(),
+    )));
+    let ctx = Ctx {
+        allow_remote_upgrade: args.allow_remote_upgrade,
+        allow_ip_quality: args.allow_ip_quality,
+        probe_state,
+        probe_started: std::time::SystemTime::now(),
+    };
+
     loop {
         // Set by `session` once the handshake completes, so a connect that
         // never finished cannot pass its CONNECT_DEADLINE off as a session
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(
-            &url,
-            &args.token,
-            &mut collector,
-            args.interval,
-            &mut connected,
-            args.allow_remote_upgrade,
-            args.allow_ip_quality,
-        )
-        .await
+        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected, &ctx).await
         {
             eprintln!("session ended: {e:#}");
         }
@@ -512,6 +529,18 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// recovery at this constant rather than at tcp_retries2.
 const HUB_SILENCE: Duration = Duration::from_secs(90);
 
+/// 每条连接都要用的**进程级**状态。
+///
+/// 为什么打包：`session` 的参数本来就有 7 个，而其中四个（两个本机开关 + 探测状态 + 起始
+/// 时刻）都属于"进程"而不属于"这条连接"—— 尤其探测状态**必须活过重连**（见 `main` 里的说明）。
+/// 打包之后既满足 clippy 的参数上限，也让"这些是要跨连接保留的"在类型上写清楚。
+struct Ctx {
+    allow_remote_upgrade: bool,
+    allow_ip_quality: bool,
+    probe_state: std::sync::Arc<probe::State>,
+    probe_started: std::time::SystemTime,
+}
+
 /// One connection: handshake, then report until the socket closes.
 async fn session(
     url: &str,
@@ -519,8 +548,7 @@ async fn session(
     collector: &mut Collector,
     interval: u64,
     connected: &mut Option<Instant>,
-    allow_remote_upgrade: bool,
-    allow_ip_quality: bool,
+    ctx: &Ctx,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
@@ -566,7 +594,10 @@ async fn session(
 
     send(
         &mut ws,
-        notify("hello", hello_payload(serde_json::to_value(&facts)?, allow_remote_upgrade, allow_ip_quality)),
+        notify(
+            "hello",
+            hello_payload(serde_json::to_value(&facts)?, ctx.allow_remote_upgrade, ctx.allow_ip_quality),
+        ),
         remaining(last_frame),
     )
     .await?;
@@ -593,11 +624,7 @@ async fn session(
     // 系统休眠或时钟跳变之后更难说清 ✓。60 秒一跳的代价只是一次整数比较 ✓（`due` 是纯函数 ✓）。
     // ⚠️ 时钟一律用 `SystemTime` ✓（与状态文件里的 Unix 秒同一种 ✓）——
     // `Instant` 不能跨重启比较 ✓，而这个判断**必须**跨重启 ✓。
-    let probe_state = std::sync::Arc::new(probe::State::new(probe::state_dir(
-        std::env::var("STATE_DIRECTORY").ok().as_deref(),
-    )));
     let probe_seed = probe::seed_from(&facts.hostname);
-    let probe_started = std::time::SystemTime::now();
     let mut probe_tick = tokio::time::interval(Duration::from_secs(60));
     probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -612,9 +639,9 @@ async fn session(
             // from the report tick, which --interval can stretch to an hour.
             _ = probe_tick.tick() => {
                 if probe::due(
-                    probe_state.last(),
+                    ctx.probe_state.last(),
                     std::time::SystemTime::now(),
-                    probe_started,
+                    ctx.probe_started,
                     probe_seed,
                 ) {
                     // ⚠️⚠️ **开跑前就记下"刚探过"** ✗✗ —— 原来只在任务末尾 remember，而一轮
@@ -625,21 +652,23 @@ async fn session(
                     //
                     // 先记再用，最坏情况是"这一轮彻底失败、要等满一个周期再试"——那是可以接受
                     // 的代价；反过来（不记）就是每 60 秒叠加一轮。
-                    probe_state.remember(std::time::SystemTime::now());
+                    ctx.probe_state.remember(std::time::SystemTime::now());
                     // ⚠️ **必须 spawn，不能占着主循环** ✗✓：一次探测最长 15 秒 ✓，
                     // 而主循环同时还在发心跳、回 ping ✓ ⇒ 阻塞它会让 hub 以为节点掉线 ✓✗。
                     // ⚠️ spawn 出去**够不到 `ws`** ✗ ⇒ 走本仓现成的那条路 ✓：
                     // 结果经 `result_tx` 回传 ✓，由主循环里既有的 `result_rx` 分支发出去 ✓
                     //（ping 任务就是这么做的 ✓）⇒ **零新管线** ✓✓。
                     let tx = result_tx.clone();
-                    let st = probe_state.clone();
+                    let st = ctx.probe_state.clone();
                     tokio::spawn(async move {
                         // 探哪些服务、以及"每个服务各自独立地报或沉默" ✓ 都在 `probe::run` 里 ✓
                         //（那样这里只剩"拿到就发" ✓ —— 主循环里不该有业务判断 ✓）。
+                        let mut delivered = true;
                         match probe::run().await {
                             Some(report) => {
                                 if tx.send(notify("probe", report)).await.is_err() {
-                                    // 主循环已经结束（连接断了 ✓）⇒ 不用管 ✓
+                                    // 主循环已经结束（连接断了）⇒ 这一轮的结果丢了。
+                                    delivered = false;
                                 }
                             }
                             // ⚠️⚠️ **全都取不到 ⇒ 什么都不报** ✗✗ —— 一次网络故障**不是**结论 ✓
@@ -651,6 +680,11 @@ async fn session(
                         // 失败也记的原因很硬 ✗：不记的话，下一跳（60 秒后 ✓）`due` 仍然是真 ✓
                         // ⇒ **每 60 秒重试一次** ✓✗（网络一坏就是探测风暴 ✓，正是我们一直在防的东西 ✓）。
                         // 记下之后，下一次要等满 6 小时 ✓ —— 代价只是"晚 6 小时再试" ✓，可以接受 ✓。
+                        if !delivered {
+                            // ⚠️ **结果没交出去 ⇒ 撤销"刚探过"** ✗：`remember` 在开跑前就写了
+                            // （防叠加），不撤销的话这一轮白探，而下一次要等满一个周期。
+                            st.forget();
+                        }
                         st.remember(std::time::SystemTime::now());
                     });
                 }
@@ -670,7 +704,7 @@ async fn session(
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
                             // **先**处理升级：下面 `ping.tasks` 那一支会把 `rpc.params` 移走。
                             if rpc.method == "upgrade.verify" {
-                                match up.text(&rpc.params, allow_remote_upgrade, secure) {
+                                match up.text(&rpc.params, ctx.allow_remote_upgrade, secure) {
                                     Some(upgrade::Step::Collecting(n)) => eprintln!("upgrade: expecting {n} bytes"),
                                     Some(upgrade::Step::Reject(why)) => {
                                         eprintln!("upgrade refused: {why}");

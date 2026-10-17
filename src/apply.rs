@@ -75,7 +75,7 @@ fn set_executable(_path: &Path) -> Result<()> {
 ///
 /// **顺序是有意的**：先留 `.prev`（回滚的唯一凭据），再换，最后写 marker。
 /// marker 在替换**之后**写，所以"有 marker"意味着"这里换过一次、还没自证过"。
-pub fn commit(plan: &Plan, from_version: &str) -> Result<()> {
+pub fn commit(plan: &Plan, from_version: &str, to_version: &str) -> Result<()> {
     if plan.prev.exists() {
         // 上一次的 `.prev` 是更早的版本；现在的自己是"上一次升级后的版本"，
         // 它才是这次要留的退路。
@@ -90,9 +90,12 @@ pub fn commit(plan: &Plan, from_version: &str) -> Result<()> {
         return Err(e).with_context(|| format!("换到 {:?}", plan.exe));
     }
     // marker 里记下**从哪来、到哪去**：远程机器上回滚之后，只有日志能告诉你发生了什么，
-    // 而"从 1.1.4 回滚到 1.1.3"比"已回滚"有用得多。新版本号取自编译进去的常量 ——
-    // 此刻运行着的就是它。
-    fs::write(&plan.marker, format!("pending {from_version} {}\n", env!("CARGO_PKG_VERSION")))
+    // 而"从 1.1.4 回滚到 1.1.3"比"已回滚"有用得多。
+    //
+    // ⚠️ `to` 必须是**公告的目标版本** ✗✗ —— 它曾经写的是 `env!("CARGO_PKG_VERSION")`，
+    // 也就是**此刻还在运行的旧版本**，于是日志永远是"1.1.15 → 1.1.15"；更要紧的是，
+    // 启动自检没有可信的"我应该是什么版本"可比（见 `same_version`）。
+    fs::write(&plan.marker, format!("pending {from_version} {to_version}\n"))
         .with_context(|| format!("写 {:?}", plan.marker))?;
     Ok(())
 }
@@ -105,6 +108,19 @@ pub fn rollback(plan: &Plan) -> Result<()> {
     fs::rename(&plan.prev, &plan.exe).with_context(|| format!("回滚到 {:?}", plan.exe))?;
     clear_marker(plan);
     Ok(())
+}
+
+/// marker 记的**目标版本**与**正在运行的版本**是否一致。
+///
+/// 只比规范化后的字符串（去空白、去前导 `v`）。任一边是空串时返回 `true` —— 那种情况下
+/// 我们说不清，而"因为格式不同就把一次升级回滚掉"更糟。
+pub fn same_version(running: &str, target: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_start_matches(['v', 'V']).to_owned();
+    let (a, b) = (norm(running), norm(target));
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+    a == b
 }
 
 /// 上一次替换是否还没自证过。
@@ -174,7 +190,7 @@ mod tests {
     fn commit_keeps_the_previous_and_leaves_a_marker() {
         let (_d, plan) = setup();
         stage(&plan, b"NEW").unwrap();
-        commit(&plan, "1.1.3").unwrap();
+        commit(&plan, "1.1.3", "1.1.4").unwrap();
         assert_eq!(fs::read(&plan.exe).unwrap(), b"NEW");
         assert_eq!(fs::read(&plan.prev).unwrap(), b"OLD", "退路必须是换之前那个");
         assert!(pending(&plan), "换过之后应当有待自证的 marker");
@@ -186,7 +202,7 @@ mod tests {
     fn rollback_restores_the_previous_and_clears_the_marker() {
         let (_d, plan) = setup();
         stage(&plan, b"NEW").unwrap();
-        commit(&plan, "1.1.3").unwrap();
+        commit(&plan, "1.1.3", "1.1.4").unwrap();
         rollback(&plan).unwrap();
         assert_eq!(fs::read(&plan.exe).unwrap(), b"OLD", "回滚后必须还是旧的");
         assert!(!pending(&plan), "回滚完就不该再有 marker");
@@ -198,7 +214,7 @@ mod tests {
     fn clearing_the_marker_keeps_the_previous_for_next_time() {
         let (_d, plan) = setup();
         stage(&plan, b"NEW").unwrap();
-        commit(&plan, "1.1.3").unwrap();
+        commit(&plan, "1.1.3", "1.1.4").unwrap();
         clear_marker(&plan);
         assert!(!pending(&plan));
         assert!(plan.prev.exists(), "自证通过不等于把退路删掉");
@@ -209,10 +225,10 @@ mod tests {
     fn a_second_upgrade_keeps_the_intermediate_version_as_the_way_back() {
         let (_d, plan) = setup();
         stage(&plan, b"V2").unwrap();
-        commit(&plan, "1.1.3").unwrap();
+        commit(&plan, "1.1.3", "1.1.4").unwrap();
         clear_marker(&plan);
         stage(&plan, b"V3").unwrap();
-        commit(&plan, "1.1.3").unwrap();
+        commit(&plan, "1.1.3", "1.1.4").unwrap();
         assert_eq!(fs::read(&plan.exe).unwrap(), b"V3");
         assert_eq!(fs::read(&plan.prev).unwrap(), b"V2", "退路是 V2（上一个能跑的）");
     }
@@ -222,10 +238,23 @@ mod tests {
     fn the_marker_names_both_versions() {
         let (_d, plan) = setup();
         stage(&plan, b"NEW").unwrap();
-        commit(&plan, "1.1.3").unwrap();
+        commit(&plan, "1.1.3", "1.1.4").unwrap();
         let (from, to) = marker_versions(&plan).expect("marker 应能读出版本");
         assert_eq!(from, "1.1.3", "换下的是谁");
-        assert_eq!(to, env!("CARGO_PKG_VERSION"), "换上的是谁（就是当前这个二进制）");
+        // ⚠️ 换上的是**公告的目标版本**，不是"当前这个二进制"的编译版本 —— 后者是旧版本，
+        // 写进去就成了"1.1.3 → 1.1.3"，而启动自检也就没有可信的"我应该是什么版本"可比。
+        assert_eq!(to, "1.1.4", "换上的是公告的那个版本");
+    }
+
+    /// 版本比对只做规范化：去空白、去前导 `v`；说不清时**不**判为不一致。
+    #[test]
+    fn versions_are_compared_after_normalising() {
+        assert!(same_version("1.1.4", "1.1.4"));
+        assert!(same_version("v1.1.4", "1.1.4"));
+        assert!(same_version(" 1.1.4 ", "1.1.4"));
+        assert!(!same_version("1.1.3", "1.1.4"), "降级必须被认出来");
+        assert!(same_version("", "1.1.4"), "说不清时不判为不一致");
+        assert!(same_version("1.1.4", ""), "说不清时不判为不一致");
     }
 
     /// 没有退路时回滚必须**报错**，而不是装作成功。

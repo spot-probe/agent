@@ -268,6 +268,18 @@ impl State {
         Some(t)
     }
 
+    /// 撤销"刚探过" —— 用于**结果没能交出去**的那一轮（连接在这一刻断了）。
+    ///
+    /// 为什么需要它：`remember` 在**开跑前**就写了（那是为了防探测自我叠加），于是结果丢失时
+    /// 那一轮就白探了 —— 而下一个 tick 要等满一个周期才重试。撤销之后下次 tick 就能重来，
+    /// 且因为上一轮已经结束，不存在叠加。
+    pub fn forget(&self) {
+        *self.memory.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some(path) = self.file() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// 记下"刚探过" ✓ —— 内存一定更新 ✓（进程内立刻生效 ✓）；**同时尽力落盘** ✓。
     /// ⚠️ 落盘失败**不是**错误返回 ✗：探测本身已经成功了 ✓，
     /// 不该因为"写不进状态文件"就让这一次探测失败 ✓✗；但这**会让下次重启失去保护** ✓ ⇒ 警告一次 ✓。
@@ -1950,6 +1962,19 @@ mod tests {
         assert!(text.contains("Transfer-Encoding: chunked"), "头部不动 ✓");
         let plain = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         assert_eq!(assemble(plain.as_bytes()), plain, "不是 chunked ⇒ 一个字都不动 ✓");
+    }
+
+    /// `forget` 之后必须回到"从没探过"。
+    ///
+    /// 它是"结果没能交出去"时的补偿：不撤销的话，那一轮白探，而下一次要等满一个周期。
+    #[test]
+    fn forgetting_a_probe_returns_to_never_probed() {
+        let st = State::new(None);
+        assert!(st.last().is_none(), "新建的状态就是'从没探过'");
+        st.remember(std::time::SystemTime::now());
+        assert!(st.last().is_some());
+        st.forget();
+        assert!(st.last().is_none(), "撤销后必须回到'从没探过'");
     }
 
     /// 时间戳落在未来时，**不能永远不探**。
