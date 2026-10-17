@@ -388,6 +388,42 @@ async fn main() -> Result<()> {
     // 会在这里就被看门兜住，而不是留下一个永远起不来的服务。
     self_check_after_upgrade();
     let argv: Vec<String> = std::env::args().collect();
+    // ⚠️ `--verify <file> <sig>`：用**编译进来的公钥**验一份下载物。
+    // 给安装脚本当"引导校验器"用 —— 已经有旧 agent 的机器可以拿它验新包，这是"替换 root 的
+    // 二进制"那一步唯一现成的可信判据（脚本自己不懂 Ed25519）。首次安装没有校验器可信任。
+    if let Some(at) = argv.iter().position(|a| a == "--verify") {
+        let (file, sig) = match (argv.get(at + 1), argv.get(at + 2)) {
+            (Some(f), Some(s)) => (f, s),
+            _ => {
+                eprintln!("--verify needs a file and its signature: --verify <file> <file.minisig>");
+                std::process::exit(2)
+            }
+        };
+        let data = match std::fs::read(file) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("cannot read {file}: {e}");
+                std::process::exit(1)
+            }
+        };
+        let text = match std::fs::read_to_string(sig) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("cannot read {sig}: {e}");
+                std::process::exit(1)
+            }
+        };
+        return match signing::verify_bytes(&data, &text) {
+            Ok(()) => {
+                println!("signature ok");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("signature FAILED: {e}");
+                std::process::exit(1)
+            }
+        };
+    }
     if let Some(at) = argv.iter().position(|a| a == "--ping") {
         let host = match argv.get(at + 1) {
             Some(host) => host.as_str(),
