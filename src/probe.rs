@@ -213,8 +213,14 @@ pub fn due(
         // 探过 ✓：按上次探测时间算周期 ✓（不看开机时刻 ✓ —— 重启不该重置周期 ✓）
         Some(last) => match now.duration_since(last) {
             Ok(since) => since >= INTERVAL,
-            // 时钟往回调过（`last` 在未来 ✓）⇒ **不探** ✓：宁可少探一次，不可风暴 ✓。
-            Err(_) => false,
+            // 时钟往回调过（`last` 在未来）⇒ **不能永远不探** ✗✗：VM 快照恢复、RTC 错、
+            // NTP 回拨都会留下一个未来的 stamp，而"去删掉那个文件"不是用户该知道的动作。
+            // 差得还不到一个周期 ⇒ 仍按原意不探（防风暴）；**超过一个周期 ⇒ 当成到期**，
+            // 探一次（随后的 remember 会把 stamp 重写回正常时刻）。
+            Err(_) => match last.duration_since(now) {
+                Ok(ahead) => ahead >= INTERVAL,
+                Err(_) => true,
+            },
         },
         // 从没探过 ✓：等过了相位才探 ✓（把六台新机器摊开 ✓）
         None => match now.duration_since(started) {
@@ -576,9 +582,14 @@ pub const CHATGPT_TRACE: &str = "https://chat.openai.com/cdn-cgi/trace";
 ///
 /// ⚠️ **地区**由 [`chatgpt_region`] 从 trace 里取 ✓（**不在这条判据里** ✓ ——
 /// 那一份是另一次请求 ✓，它的成败不该影响"能不能用"这个结论 ✓✓）。
-pub fn chatgpt_verdict(api_body: &str, ios_body: &str, favicon_status: u16) -> Verdict {
-    // ⚠️ 二次确认就在这一行 ✓：字符串 + favicon 403 **两者都成立**才算 API 那边不支持 ✓
-    let api_bad = api_body.contains("unsupported_country") && favicon_status == 403;
+pub fn chatgpt_verdict(api_body: &str, ios_body: &str, favicon_status: Option<u16>) -> Verdict {
+    // ⚠️⚠️ 二次确认必须拿到**真的** 403 才算数 ✗✗ —— 取不到 favicon 时此前是 `unwrap_or(0)`，
+    // 而 0 让 `api_bad` 恒假 ⇒ 把"没确认"说成"确认没问题"，方向正好与"失败不是结论"相反：
+    // 一次网络失败会直接报出一条"可用"。缺了那一半就说不出是哪一档，如实"没读明白"。
+    let Some(favicon) = favicon_status else {
+        return Verdict { status: Status::Unknown, region: None };
+    };
+    let api_bad = api_body.contains("unsupported_country") && favicon == 403;
     let ios_bad = ios_body.contains("VPN");
     let status = match (api_bad, ios_bad) {
         (false, false) => Status::Unlocked,
@@ -601,7 +612,11 @@ pub fn chatgpt_verdict(api_body: &str, ios_body: &str, favicon_status: u16) -> V
 ///
 /// ⚠️ 为什么把 favicon 当**参数**而不是在里面 await ✗：这一条要是纯的 ✓ 才测得了 ✓
 ///（判据能测，是这个仓最值钱的那条规矩 ✓）。
-fn chatgpt_from_results(api: Option<&str>, ios: Option<&str>, favicon_status: u16) -> Option<Verdict> {
+fn chatgpt_from_results(
+    api: Option<&str>,
+    ios: Option<&str>,
+    favicon_status: Option<u16>,
+) -> Option<Verdict> {
     match (api, ios) {
         (Some(a), Some(b)) => Some(chatgpt_verdict(a, b, favicon_status)),
         (Some(_), None) | (None, Some(_)) => Some(Verdict { status: Status::Unknown, region: None }),
@@ -814,9 +829,10 @@ pub async fn run() -> Option<serde_json::Value> {
     let both = api.is_some() && ios.is_some();
     let favicon = if both {
         // favicon 只**看状态码** ✓ ⇒ 用 `fetch_status` ✓（非 200 是它的正常取值之一 ✓，不是失败 ✓）
-        fetch_status(CHATGPT_FAVICON, CHATGPT_FAVICON_HEADERS).await.map(|(s, _)| s).unwrap_or(0)
+        // ⚠️ 取不到就是 `None`，**不是 0** —— 见 `chatgpt_verdict` 的说明。
+        fetch_status(CHATGPT_FAVICON, CHATGPT_FAVICON_HEADERS).await.map(|(s, _)| s).ok()
     } else {
-        0
+        None
     };
     if let Some(mut v) = chatgpt_from_results(api.as_deref(), ios.as_deref(), favicon) {
         // 地区来自**另一次**请求（trace ✓）—— ⚠️ 它取不到**不影响**"能不能用"这个结论 ✓✓。
@@ -1136,8 +1152,12 @@ fn build_request(path: &str, authority: &str, extra_header: &str) -> String {
         |name: &str| extra.lines().any(|l| l.trim().to_ascii_lowercase().starts_with(&format!("{name}:")));
     let ua = if has("user-agent") { "" } else { "User-Agent: monitor-agent\r\n" };
     let accept = if has("accept") { "" } else { "Accept: */*\r\n" };
+    // ⚠️ **显式要 identity** ✗✓ —— 合规服务器不会主动压，但中间层可能，而我们的判据按文本
+    // 匹配正文：一旦被 gzip 了，AmazonPV 会报"未解锁"、Netflix/Reddit 报"可用"，
+    // 而且没有任何"解不开"的错误。
+    let encoding = if has("accept-encoding") { "" } else { "Accept-Encoding: identity\r\n" };
     let extra_line = extra.as_str();
-    format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\n{ua}{accept}{extra_line}Connection: close\r\n\r\n")
+    format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\n{ua}{accept}{encoding}{extra_line}Connection: close\r\n\r\n")
 }
 
 async fn get_once(
@@ -1757,11 +1777,18 @@ mod tests {
         let clean_ios = "<html>hello</html>";
         let bad_ios = "<html>VPN detected</html>";
         // 都干净 ⇒ 解锁 ✓；都有问题（且 favicon 也是 403 ✓）⇒ 未解锁 ✓
-        assert_eq!(chatgpt_verdict(clean_api, clean_ios, 200).status, Status::Unlocked);
-        assert_eq!(chatgpt_verdict(bad_api, bad_ios, 403).status, Status::Blocked);
+        assert_eq!(chatgpt_verdict(clean_api, clean_ios, Some(200)).status, Status::Unlocked);
+        assert_eq!(chatgpt_verdict(bad_api, bad_ios, Some(403)).status, Status::Blocked);
+        // ⚠️ **取不到 favicon 就不能替它下结论**：此前是 `unwrap_or(0)`，0 让"API 不支持"
+        // 恒假 ⇒ 一次网络失败会直接报"可用"。
+        assert_eq!(
+            chatgpt_verdict(bad_api, bad_ios, None).status,
+            Status::Unknown,
+            "缺了二次确认那一半 ⇒ 如实说没读明白"
+        );
         // ⚠️ 只有 iOS 有问题 ⇒ **网页能用** ✓；只有 API 有问题 ⇒ **App 能用** ✓
-        assert_eq!(chatgpt_verdict(clean_api, bad_ios, 200).status, Status::Web);
-        assert_eq!(chatgpt_verdict(bad_api, clean_ios, 403).status, Status::App);
+        assert_eq!(chatgpt_verdict(clean_api, bad_ios, Some(200)).status, Status::Web);
+        assert_eq!(chatgpt_verdict(bad_api, clean_ios, Some(403)).status, Status::App);
     }
 
     /// ⚠️⚠️ **favicon 的 403 是"二次确认"** ✓✓ —— 少了它，API 响应里**随便一个字符串**
@@ -1772,10 +1799,10 @@ mod tests {
         // favicon 不是 403 ⇒ **那个字符串不算数** ✓ ⇒ 仍然按"API 没问题"处理 ✓
         // ⚠️ **必须大写 `VPN`** ✗✓ —— 判据是 `contains("VPN")`（照参考实现 ✓），
         // 而 fixture 里写小写会静默落进另一档 ✓✗（我第一版就是这么写错的 ✓，被按名字跑抓到 ✓）。
-        assert_eq!(chatgpt_verdict(bad_api, "<html>VPN</html>", 200).status, Status::Web);
-        assert_eq!(chatgpt_verdict(bad_api, "<html>ok</html>", 404).status, Status::Unlocked);
+        assert_eq!(chatgpt_verdict(bad_api, "<html>VPN</html>", Some(200)).status, Status::Web);
+        assert_eq!(chatgpt_verdict(bad_api, "<html>ok</html>", Some(404)).status, Status::Unlocked);
         // 只有 403 才认 ✓
-        assert_eq!(chatgpt_verdict(bad_api, "<html>ok</html>", 403).status, Status::App);
+        assert_eq!(chatgpt_verdict(bad_api, "<html>ok</html>", Some(403)).status, Status::App);
     }
 
     /// 地区取 Cloudflare trace 的 `loc=XX` ✓ —— 形状检查照旧 ✓（两位大写 ✓）。
@@ -1925,6 +1952,21 @@ mod tests {
         assert_eq!(assemble(plain.as_bytes()), plain, "不是 chunked ⇒ 一个字都不动 ✓");
     }
 
+    /// 时间戳落在未来时，**不能永远不探**。
+    ///
+    /// VM 快照恢复、RTC 错、NTP 回拨都会留下一个未来的 stamp；旧实现在 `duration_since`
+    /// 报错时直接 `false` ⇒ 之后除非有人删掉那个文件，否则再也不探（面板上那台机器
+    /// 一直停在上一次结论）。差得不到一个周期仍按原意不探 —— 那是防风暴；超过一个周期
+    /// 就当它已经到期。
+    #[test]
+    fn a_stamp_far_in_the_future_does_not_stop_probing_forever() {
+        let now = std::time::SystemTime::now();
+        let far = now + INTERVAL * 3;
+        assert!(due(Some(far), now, now, 0), "未来超过一个周期 ⇒ 探一次");
+        let near = now + std::time::Duration::from_secs(30);
+        assert!(!due(Some(near), now, now, 0), "只差一点 ⇒ 仍不探（防风暴）");
+    }
+
     /// 截断时，**靠"缺席"得出的结论不成立**。
     ///
     /// AmazonPV 实测页 506 KB、上限曾是 512 KB：只剩 6 KB 余量，`currentTerritory` 落在
@@ -2053,12 +2095,15 @@ mod tests {
         let api = r#"{"unsupported_country": true}"#;
         let ios = "<html>VPN</html>";
         // 两边都读到 ⇒ 照原判据 ✓（API 有问题 + favicon 403 ⇒ 未解锁 ✓）
-        assert_eq!(chatgpt_from_results(Some(api), Some(ios), 403).map(|v| v.status), Some(Status::Blocked));
+        assert_eq!(
+            chatgpt_from_results(Some(api), Some(ios), Some(403)).map(|v| v.status),
+            Some(Status::Blocked)
+        );
         // ⚠️ 只有一边 ⇒ **没读明白**（不是沉默 ✗，也不是猜 ✓）
-        assert_eq!(chatgpt_from_results(Some(api), None, 0).map(|v| v.status), Some(Status::Unknown));
-        assert_eq!(chatgpt_from_results(None, Some(ios), 0).map(|v| v.status), Some(Status::Unknown));
+        assert_eq!(chatgpt_from_results(Some(api), None, Some(0)).map(|v| v.status), Some(Status::Unknown));
+        assert_eq!(chatgpt_from_results(None, Some(ios), Some(0)).map(|v| v.status), Some(Status::Unknown));
         // 两边都没读到 ⇒ **什么都不报** ✓
-        assert!(chatgpt_from_results(None, None, 0).is_none());
+        assert!(chatgpt_from_results(None, None, Some(0)).is_none());
     }
 
     /// ⚠️ **夹具要够大** ✗✓ —— 判据现在先过一道"这像不像产品页"的地板 ✓（[`PAGE_FLOOR`] ✓），

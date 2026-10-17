@@ -847,14 +847,25 @@ fn respawn_ping_tasks(
 /// `ping_once` blocks, so it runs on a blocking thread rather than growing an async
 /// socket layer in a binary whose runtime is single-threaded.
 async fn icmp_ping(target: &str) -> Result<Duration, icmp::IcmpError> {
-    let addr = tokio::net::lookup_host((target, 0))
-        .await
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-        .ok_or(icmp::IcmpError::Address)?;
-    tokio::task::spawn_blocking(move || icmp::ping_once(addr, HANDSHAKE_DEADLINE))
-        .await
-        .map_err(|_| icmp::IcmpError::Socket)?
+    // ⚠️ 与 TCP 那条**同样的两件事** ✗✗：
+    //   ① 解析要有预算 —— glibc 撞上黑洞 nameserver 能拖几十秒，而那是解析时间不是延迟；
+    //   ② **要逐个地址试** —— 双栈机器上 glibc 把 v6 排在前面，而 v6 往往没有路由。
+    //      只试第一个的话，同一台机器会"TCP 正常、ICMP 永远没回复"（面板上是错误而不是延迟），
+    //      而 TCP 那边早就有 `MAX_PING_ADDRS` 了。
+    let Ok(Ok(resolved)) =
+        tokio::time::timeout(HANDSHAKE_DEADLINE, tokio::net::lookup_host((target, 0))).await
+    else {
+        return Err(icmp::IcmpError::Address);
+    };
+    let mut last = icmp::IcmpError::Address;
+    for addr in resolved.take(MAX_PING_ADDRS) {
+        match tokio::task::spawn_blocking(move || icmp::ping_once(addr, HANDSHAKE_DEADLINE)).await {
+            Ok(Ok(rtt)) => return Ok(rtt),
+            Ok(Err(e)) => last = e,
+            Err(_) => last = icmp::IcmpError::Socket,
+        }
+    }
+    Err(last)
 }
 
 /// Deadline for one handshake, deliberately under the kernel's first SYN
