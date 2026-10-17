@@ -132,7 +132,7 @@ fn self_check_after_upgrade() {
             // 说的：它可以公告一个更高的版本、却喂一个**更旧的、已签名的**二进制。那种情况下
             // 我们刚把自己降级了，而连接一切正常 ⇒ 180 秒自检会放行。所以先比版本：
             // 不一致就**立刻回滚**，不等自检。
-            if !apply::same_version(env!("CARGO_PKG_VERSION"), &to) {
+            if apply::should_roll_back(&from, &to, env!("CARGO_PKG_VERSION")) {
                 eprintln!("升级异常：公告的是 {to}，实际运行的是 {} ⇒ 立即回滚", env!("CARGO_PKG_VERSION"));
                 match apply::rollback(&plan) {
                     Ok(()) => std::process::exit(1),
