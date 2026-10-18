@@ -21,7 +21,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # 与 rust-toolchain.toml 同一版本（fmt 的结果随 rustfmt 版本变）。
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy, rustfmt
       - run: cargo fmt --all --check

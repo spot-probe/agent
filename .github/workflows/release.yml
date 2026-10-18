@@ -22,7 +22,8 @@ jobs:
         run: |
           V=v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
           [ "$GITHUB_REF_NAME" = "$V" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $V"; exit 1; }
-      - uses: dtolnay/rust-toolchain@stable
+      # 与 rust-toolchain.toml 同一版本。
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: ${{ matrix.target }}
       - run: cargo install --locked cross
