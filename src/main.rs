@@ -75,6 +75,22 @@ fn hello_payload(
     v
 }
 
+/// 这一轮该不该探：**这台机器允许检测**，且排程到点了。
+///
+/// 许可在这里，而不是"探了但不上报"——探测本身要**主动去访问 Netflix / YouTube 等站点**，
+/// 出网行为该由这台机器的主人决定。这也与 panel 上那格「未允许检测」是同一句话。
+///
+/// 抽成纯函数是为了**能被测**：真正那一支在 `select!` 里，单元测试够不着。
+fn should_probe(
+    allow_ip_quality: bool,
+    last: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+    started: std::time::SystemTime,
+    seed: u64,
+) -> bool {
+    allow_ip_quality && crate::probe::due(last, now, started, seed)
+}
+
 /// 拿到结论之后的收尾：**回报**，并在"验过且要求换"时真正**换上去**。
 ///
 /// 暂存已经在 `upgrade::binary` 里做过（那时那几 MB 还在手上）；这里只做**危险的 rename**。
@@ -182,13 +198,22 @@ fn usage() -> ! {
            --insecure           Allow plain ws:// to a remote hub; the token\n                       \
                                 travels in the clear. Only for a hub reached\n                       \
                                 at ip:port with no TLS in front.\n  \
-           --allow-remote-upgrade [--allow-ip-quality]\n                       \
+           --allow-remote-upgrade\n                       \
                                 **Let the hub replace this agent's binary**\n                       \
                                 (over wss only, and only if it verifies\n                       \
                                 against the key compiled into the agent).\n                       \
                                 Off by default: without it, upgrading this\n                       \
                                 machine means running the installer again\n                       \
-                                over SSH.\n",
+                                over SSH.\n  \
+           --allow-ip-quality   **Let the hub look up this machine's IP**\n                       \
+                                (city/ASN/Tor from a local database, and its\n                       \
+                                address sent to an online risk service), and\n                       \
+                                **let this agent probe streaming services**\n                       \
+                                every 6 hours. Off by default: without it the\n                       \
+                                hub neither looks this machine up nor sends\n                       \
+                                its address anywhere, and the agent makes no\n                       \
+                                such requests. The hub can read this choice\n                       \
+                                but never change it.\n",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
@@ -674,7 +699,13 @@ async fn session(
             // HUB_SILENCE rather than a polling interval more. Kept separate
             // from the report tick, which --interval can stretch to an hour.
             _ = probe_tick.tick() => {
-                if probe::due(
+                // ⭐ **许可** ✓：没允许检测的节点**一轮都不探** ✓ —— 与 IP 质量那两条同一个旗子 ✓
+                //（面板上那格写「未允许检测」说的就是它 ✓）。这不只是"别上报"✗：
+                // 探测本身要**主动去访问 Netflix / YouTube 等站点** ✓，出网行为该由这台机器的主人决定 ✓。
+                // ⚠️ 放在 `due` **之前**、而且此时**不动 `probe_state`** ✓：不探就不该写"上次探过" ✓，
+                // 否则以后允许了还要白等一个周期 ✗（许可只随重装变化，而重装会重启进程，状态本来就会重来 ✓）。
+                if should_probe(
+                    ctx.allow_ip_quality,
                     ctx.probe_state.last(),
                     std::time::SystemTime::now(),
                     ctx.probe_started,
@@ -1011,6 +1042,24 @@ async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 许可不通过时**连排程都不看** —— 这正是 `--allow-ip-quality` 对探测的作用。
+    #[test]
+    fn probing_needs_the_permission_before_it_even_checks_the_schedule() {
+        use std::time::{Duration, SystemTime};
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        // 排程早就该探了（`last` 是很久以前），但只要没许可，就不探。
+        let long_ago = Some(t0 - Duration::from_secs(100 * 3600));
+        assert!(
+            !should_probe(false, long_ago, t0, t0, 7),
+            "没允许检测的节点，到点也不该探 —— 探测要主动出网访问那些站点"
+        );
+        // 反过来：允许之后，同一组排程参数就该放行（否则上一条会因别的原因假通过）。
+        assert!(should_probe(true, long_ago, t0, t0, 7), "允许且到点就该探");
+        // 没到点的时候许可也救不了它 —— 两个条件是与的关系。
+        let just_now = Some(t0 - Duration::from_secs(60));
+        assert!(!should_probe(true, just_now, t0, t0, 7), "允许了也得到点");
+    }
 
     #[test]
     fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {
