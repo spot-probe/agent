@@ -1,7 +1,6 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
-mod probe;
 // ICMP echo: pure packet handling and its tests. Not called yet -- the task's
 // `kind` reaches the hub first (see notes/plan-icmp-ping.md), so nothing uses it.
 mod apply;
@@ -64,31 +63,8 @@ fn hello_payload(
         // 否则 hub 分不清"这台没允许检测"与"允许了但还没查到" ✓✗，
         // 而面板上那两件事长得完全不同 ✓（一个该显示"未允许检测" ✓，一个该显示"暂无数据" ✓）。
         o.insert("allow_ip_quality".into(), serde_json::json!(allow_ip_quality));
-        // ⭐ **能力**（不是许可 ✓）：这个二进制里有没有"会探流媒体"这段代码 ✓ ——
-        // 编译期就定了 ✓ ⇒ **不需要参数、不需要状态** ✓（与上面那个许可不同 ✓，
-        // 许可是"这台机器准不准" ✓，能力是"这个版本会不会" ✓ —— 两件事 ✓）。
-        // ⚠️ 它影响的是**面板措辞** ✓：让面板能说"版本不支持探测" ✓，
-        // 而不是让旧节点永远显示"还没测过" ✓✗（那是两种处境 ✓，处置也不同 ✓）。
-        // ⚠️ 名字与 hub 侧必须一致 ✓（hub 读的就是这个键 ✓）—— 两边各有一条测试钉住它 ✓✓。
-        o.insert("stream_probe".into(), serde_json::json!(true));
     }
     v
-}
-
-/// 这一轮该不该探：**这台机器允许检测**，且排程到点了。
-///
-/// 许可在这里，而不是"探了但不上报"——探测本身要**主动去访问 Netflix / YouTube 等站点**，
-/// 出网行为该由这台机器的主人决定。这也与 panel 上那格「未允许检测」是同一句话。
-///
-/// 抽成纯函数是为了**能被测**：真正那一支在 `select!` 里，单元测试够不着。
-fn should_probe(
-    allow_ip_quality: bool,
-    last: Option<std::time::SystemTime>,
-    now: std::time::SystemTime,
-    started: std::time::SystemTime,
-    seed: u64,
-) -> bool {
-    allow_ip_quality && crate::probe::due(last, now, started, seed)
 }
 
 /// 拿到结论之后的收尾：**回报**，并在"验过且要求换"时真正**换上去**。
@@ -207,13 +183,11 @@ fn usage() -> ! {
                                 over SSH.\n  \
            --allow-ip-quality   **Let the hub look up this machine's IP**\n                       \
                                 (city/ASN/Tor from a local database, and its\n                       \
-                                address sent to an online risk service), and\n                       \
-                                **let this agent probe streaming services**\n                       \
-                                every 6 hours. Off by default: without it the\n                       \
-                                hub neither looks this machine up nor sends\n                       \
-                                its address anywhere, and the agent makes no\n                       \
-                                such requests. The hub can read this choice\n                       \
-                                but never change it.\n",
+                                address sent to an online risk service).\n                       \
+                                Off by default: without it the hub neither\n                       \
+                                looks this machine up nor sends its address\n                       \
+                                anywhere. The hub can read this choice but\n                       \
+                                never change it.\n",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
@@ -459,28 +433,10 @@ async fn main() -> Result<()> {
         };
         return self_test(host).await;
     }
-    // 与上面 `--ping` 同一个位置、同一个理由：一次诊断既不需要服务器也不需要 token，
-    // 而 `parse_args` 两者都要。于是它可以在一台有问题的机器上直接跑，不用动 unit、
-    // 也不用等 6 小时一轮的排程。
+    // 流媒体探测已下线：`--probe-once` / `--dump-body` 这两个调试参数**仍然被接受**
+    // （老 unit 文件里可能还写着），但什么也不做 —— 直接 bail 会让那台机器的 agent 起不来。
     if argv.iter().any(|a| a == "--probe-once") {
-        // 可选：`--dump-body <目录>` 把每份正文也写进去。有些问题只有看见正文才能定性
-        //（例如"服务端给我们的是一页 33 KB 的东西，而 curl 拿到的是 950 KB"）。
-        let dump = argv.iter().position(|a| a == "--dump-body").and_then(|i| argv.get(i + 1)).cloned();
-        if let Some(dir) = dump.as_deref() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                eprintln!("--dump-body {dir} 建不出来：{e}");
-                std::process::exit(2);
-            }
-        }
-        probe::start_diagnostics(dump);
-        let report = probe::run().await;
-        for line in probe::take_diagnostics() {
-            println!("{line}");
-        }
-        match report {
-            Some(v) => println!("报文 {v}"),
-            None => println!("这一轮什么都没探到（全部失败）"),
-        }
+        eprintln!("--probe-once 已废弃：流媒体探测已从本版本移除，本次直接退出。");
         return Ok(());
     }
 
@@ -504,19 +460,8 @@ async fn main() -> Result<()> {
     );
     let mut wait = 0u64;
 
-    // ⚠️ **探测状态与"首探相位"必须活过重连** ✗✗ —— 它们此前在 `session()` 里建：每断一次线
-    // `started` 就归零 ⇒ 首探相位要重新等一遍（连接比相位短的话**永远等不到首探**）；
-    // 没有 `StateDirectory=` 的老安装连"上次探过"也随之丢掉（重连后又探一轮）。
-    // 提到这里：一个进程只有一份状态，重连不再影响它。
-    let probe_state = std::sync::Arc::new(probe::State::new(probe::state_dir(
-        std::env::var("STATE_DIRECTORY").ok().as_deref(),
-    )));
-    let ctx = Ctx {
-        allow_remote_upgrade: args.allow_remote_upgrade,
-        allow_ip_quality: args.allow_ip_quality,
-        probe_state,
-        probe_started: std::time::SystemTime::now(),
-    };
+    let ctx =
+        Ctx { allow_remote_upgrade: args.allow_remote_upgrade, allow_ip_quality: args.allow_ip_quality };
 
     loop {
         // Set by `session` once the handshake completes, so a connect that
@@ -592,14 +537,12 @@ const HUB_SILENCE: Duration = Duration::from_secs(90);
 
 /// 每条连接都要用的**进程级**状态。
 ///
-/// 为什么打包：`session` 的参数本来就有 7 个，而其中四个（两个本机开关 + 探测状态 + 起始
-/// 时刻）都属于"进程"而不属于"这条连接"—— 尤其探测状态**必须活过重连**（见 `main` 里的说明）。
-/// 打包之后既满足 clippy 的参数上限，也让"这些是要跨连接保留的"在类型上写清楚。
+/// 为什么打包：`session` 的参数本来就有 7 个，而其中两个（两个本机开关）都属于"进程"
+/// 而不属于"这条连接"。打包之后既满足 clippy 的参数上限，也让"这些是要跨连接保留的"
+/// 在类型上写清楚。
 struct Ctx {
     allow_remote_upgrade: bool,
     allow_ip_quality: bool,
-    probe_state: std::sync::Arc<probe::State>,
-    probe_started: std::time::SystemTime,
 }
 
 /// One connection: handshake, then report until the socket closes.
@@ -680,15 +623,6 @@ async fn session(
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // ⭐ 流媒体探测的排程 ✓（第一期第四步的接线 ✓）。
-    // ⚠️ **60 秒一跳**，而不是"睡 6 小时" ✗：后者会让"该探了"的判断粗糙到分钟级不可控 ✓，
-    // 系统休眠或时钟跳变之后更难说清 ✓。60 秒一跳的代价只是一次整数比较 ✓（`due` 是纯函数 ✓）。
-    // ⚠️ 时钟一律用 `SystemTime` ✓（与状态文件里的 Unix 秒同一种 ✓）——
-    // `Instant` 不能跨重启比较 ✓，而这个判断**必须**跨重启 ✓。
-    let probe_seed = probe::seed_from(&facts.hostname);
-    let mut probe_tick = tokio::time::interval(Duration::from_secs(60));
-    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -698,64 +632,6 @@ async fn session(
             // Rebuilt each pass from the last frame, so silence costs exactly
             // HUB_SILENCE rather than a polling interval more. Kept separate
             // from the report tick, which --interval can stretch to an hour.
-            _ = probe_tick.tick() => {
-                // ⭐ **许可** ✓：没允许检测的节点**一轮都不探** ✓ —— 与 IP 质量那两条同一个旗子 ✓
-                //（面板上那格写「未允许检测」说的就是它 ✓）。这不只是"别上报"✗：
-                // 探测本身要**主动去访问 Netflix / YouTube 等站点** ✓，出网行为该由这台机器的主人决定 ✓。
-                // ⚠️ 放在 `due` **之前**、而且此时**不动 `probe_state`** ✓：不探就不该写"上次探过" ✓，
-                // 否则以后允许了还要白等一个周期 ✗（许可只随重装变化，而重装会重启进程，状态本来就会重来 ✓）。
-                if should_probe(
-                    ctx.allow_ip_quality,
-                    ctx.probe_state.last(),
-                    std::time::SystemTime::now(),
-                    ctx.probe_started,
-                    probe_seed,
-                ) {
-                    // ⚠️⚠️ **开跑前就记下"刚探过"** ✗✗ —— 原来只在任务末尾 remember，而一轮
-                    // 实际远不止 15 秒：每个请求 15 秒上限 × 最多 4 次跳转 × 十来个请求，串行
-                    // 下来是几分钟。期间**每 60 秒的 tick 会再 spawn 一轮** ⇒ 探测自我叠加：
-                    // 重复请求、重复上报，几轮的响应体同时驻留，可能撞上 unit 的 MemoryMax=64M
-                    // ⇒ OOM 重启；而重启后 `last` 没更新 ⇒ 立刻再探（探测风暴）。
-                    //
-                    // 先记再用，最坏情况是"这一轮彻底失败、要等满一个周期再试"——那是可以接受
-                    // 的代价；反过来（不记）就是每 60 秒叠加一轮。
-                    ctx.probe_state.remember(std::time::SystemTime::now());
-                    // ⚠️ **必须 spawn，不能占着主循环** ✗✓：一次探测最长 15 秒 ✓，
-                    // 而主循环同时还在发心跳、回 ping ✓ ⇒ 阻塞它会让 hub 以为节点掉线 ✓✗。
-                    // ⚠️ spawn 出去**够不到 `ws`** ✗ ⇒ 走本仓现成的那条路 ✓：
-                    // 结果经 `result_tx` 回传 ✓，由主循环里既有的 `result_rx` 分支发出去 ✓
-                    //（ping 任务就是这么做的 ✓）⇒ **零新管线** ✓✓。
-                    let tx = result_tx.clone();
-                    let st = ctx.probe_state.clone();
-                    tokio::spawn(async move {
-                        // 探哪些服务、以及"每个服务各自独立地报或沉默" ✓ 都在 `probe::run` 里 ✓
-                        //（那样这里只剩"拿到就发" ✓ —— 主循环里不该有业务判断 ✓）。
-                        let mut delivered = true;
-                        match probe::run().await {
-                            Some(report) => {
-                                if tx.send(notify("probe", report)).await.is_err() {
-                                    // 主循环已经结束（连接断了）⇒ 这一轮的结果丢了。
-                                    delivered = false;
-                                }
-                            }
-                            // ⚠️⚠️ **全都取不到 ⇒ 什么都不报** ✗✗ —— 一次网络故障**不是**结论 ✓
-                            //（那是这一块最容易犯的错 ✓）；不报 ⇒ 面板看到的是
-                            // "上次的结论 + 它有多旧" ✓✓，那是实话 ✓。
-                            None => eprintln!("probe: nothing could be fetched; no verdict reported (a failure is not a verdict)"),
-                        }
-                        // ⚠️⚠️ **无论成败都要记下"刚探过"** ✓✓ ——
-                        // 失败也记的原因很硬 ✗：不记的话，下一跳（60 秒后 ✓）`due` 仍然是真 ✓
-                        // ⇒ **每 60 秒重试一次** ✓✗（网络一坏就是探测风暴 ✓，正是我们一直在防的东西 ✓）。
-                        // 记下之后，下一次要等满 6 小时 ✓ —— 代价只是"晚 6 小时再试" ✓，可以接受 ✓。
-                        if !delivered {
-                            // ⚠️ **结果没交出去 ⇒ 撤销"刚探过"** ✗：`remember` 在开跑前就写了
-                            // （防叠加），不撤销的话这一轮白探，而下一次要等满一个周期。
-                            st.forget();
-                        }
-                        st.remember(std::time::SystemTime::now());
-                    });
-                }
-            }
             _ = tokio::time::sleep(remaining(last_frame)) => {
                 break Err(anyhow!("no frame from the hub in {}s", HUB_SILENCE.as_secs()));
             }
@@ -1043,24 +919,6 @@ async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32
 mod tests {
     use super::*;
 
-    /// 许可不通过时**连排程都不看** —— 这正是 `--allow-ip-quality` 对探测的作用。
-    #[test]
-    fn probing_needs_the_permission_before_it_even_checks_the_schedule() {
-        use std::time::{Duration, SystemTime};
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        // 排程早就该探了（`last` 是很久以前），但只要没许可，就不探。
-        let long_ago = Some(t0 - Duration::from_secs(100 * 3600));
-        assert!(
-            !should_probe(false, long_ago, t0, t0, 7),
-            "没允许检测的节点，到点也不该探 —— 探测要主动出网访问那些站点"
-        );
-        // 反过来：允许之后，同一组排程参数就该放行（否则上一条会因别的原因假通过）。
-        assert!(should_probe(true, long_ago, t0, t0, 7), "允许且到点就该探");
-        // 没到点的时候许可也救不了它 —— 两个条件是与的关系。
-        let just_now = Some(t0 - Duration::from_secs(60));
-        assert!(!should_probe(true, just_now, t0, t0, 7), "允许了也得到点");
-    }
-
     #[test]
     fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {
         // Nothing on the other end: double to the ceiling and hold. Zero is
@@ -1344,16 +1202,11 @@ mod tests {
         respawn_ping_tasks(&mut running, flood, &tx);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
     }
-    /// ⭐ **能力旗子** ✓：hello 里必须带上"我会探流媒体" ✓ ——
-    /// 面板靠它把「**版本不支持探测**」与「**还没测过**」分开 ✓✓（那是两种处境 ✓）。
-    /// ⚠️ 键名与 hub 侧**必须逐字一致** ✓（hub 读的就是 `stream_probe` ✓）——
-    /// 这条测试就是钉住它的那一半 ✓✓（另一半在 hub 的测试里 ✓）。
+    /// 两个**许可**是独立的两件事，关着的时候 hello 必须照实说 `false` ——
+    /// hub 靠它区分「没允许」与「允许了但还没查到」。
     #[test]
-    fn the_hello_says_this_version_can_probe_streaming() {
+    fn the_hello_reports_both_permissions_as_they_are() {
         let v = hello_payload(serde_json::json!({}), false, false);
-        assert_eq!(v["stream_probe"], serde_json::json!(true), "键名与取值都要对 ✓");
-        // ⚠️ 它与那两个**许可**是独立的三件事 ✓：许可关着，能力照样在 ✓
-        //（"不准探"与"不会探"完全不同 ✓ —— 面板要分别说 ✓）
         assert_eq!(v["allow_remote_upgrade"], serde_json::json!(false));
         assert_eq!(v["allow_ip_quality"], serde_json::json!(false));
     }
